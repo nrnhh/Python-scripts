@@ -12,6 +12,9 @@ imap_port = 993  # SSL üçün standart
 email_address = "nuran.hasanov@bmp.az"
 password = "N2024!H"  # Sənin şifrən
 
+# İcazəli göndərən email-lər (yalnız bunlardan gələnlər)
+allowed_emails = ["hamid.abdulov@bmp.az", "feyruz.mirzayev@bmp.az", "parviz.aliyev@bmp.az"]
+
 def connect_to_email():
     # SSL ilə qoşul
     mail = imaplib.IMAP4_SSL(imap_server, imap_port)
@@ -19,21 +22,22 @@ def connect_to_email():
     mail.select("INBOX")  # Inbox qovluğunu seç (gələn e-poçtlar)
     return mail
 
-def search_emails_containing_word(mail, words=["icra", "ICRA"]):
-    # "icra" VƏ YA "ICRA" sözlərini ehtiva edən e-poçtları axtar (subject və ya body-də, case insensitive)
-    search_criteria = ' '.join([f'TEXT "{word}"' for word in words])  # Boşluqla birləşdir (OR üçün ayrıca)
-    status, messages = mail.search(None, f'(OR {search_criteria})')
+def search_emails_containing_word(mail, word="icra"):
+    # "icra" sözünü ehtiva edən e-poçtları axtar (case-insensitive TEXT axtarışı, serverdə LOWER kimi işləyir)
+    # %icra% kimi wildcards IMAP-də SUBSTRING ilə, amma sadə TEXT kifayətdir (boyuk/kiçik hərfləri əhatə edir)
+    status, messages = mail.search(None, f'TEXT "{word}"')
     email_ids = messages[0].split()
     
     # Email ID-lərini int-ə çevir və tərs sırala (ən yenidən köhnəyə, çünki ID-lər artan)
     sorted_ids = sorted([int(id) for id in email_ids], reverse=True)
     total_count = len(sorted_ids)
     
-    print(f"'{words}' sözlərini ehtiva edən ümumi e-poçtların sayı: {total_count}")
+    print(f"'{word}' sözünü ehtiva edən ümumi e-poçtların sayı (filterlənməmiş, boyuk/kiçik hərflər daxil): {total_count}")
     
-    # Hər bir göndərəndən neçə e-poçt gəlib olduğunu hesabla (yalnız xarici sender-lər, sənin öz e-poçtların düşməsin)
+    # Yalnız icazəli sender-lərdən olanları filter et
     senders = []
     email_details = []  # Detallar üçün saxla
+    filtered_count = 0
     for num in sorted_ids:  # Yenidən köhnəyə
         try:
             status, msg_data = mail.fetch(str(num), "(RFC822)")
@@ -42,7 +46,8 @@ def search_emails_containing_word(mail, words=["icra", "ICRA"]):
             if isinstance(from_header, bytes):
                 from_header = from_header.decode()
             realname, sender_email = parseaddr(from_header)
-            if sender_email and sender_email.lower() != email_address.lower():  # Öz e-poçtun deyilsə
+            if sender_email and sender_email.lower() in [e.lower() for e in allowed_emails]:  # Yalnız icazəli sender-lər
+                filtered_count += 1
                 # Göndərəni ad + email formatında saxla
                 full_sender = f"{realname} <{sender_email}>" if realname else sender_email
                 senders.append(full_sender)
@@ -72,6 +77,8 @@ def search_emails_containing_word(mail, words=["icra", "ICRA"]):
             print(f"Bu e-poçtu oxumaqda xəta (ID {num}): {fetch_error}")
             continue
     
+    print(f"İcazəli göndərənlərdən filterlənmiş e-poçtların sayı: {filtered_count}")
+    
     sender_counts = Counter(senders)
     
     # Aylara görə ümumi saylar (yalnız valide tarixlər)
@@ -91,7 +98,7 @@ def search_emails_containing_word(mail, words=["icra", "ICRA"]):
             })
     
     # Nəticələri çap et (ən çoxdan az-a doğru sırala)
-    print("\nHər xarici göndərəndən gələn e-poçtların sayı (sənin cavabların düşməyib):")
+    print("\nHər icazəli göndərəndən gələn e-poçtların sayı:")
     for sender, count in sender_counts.most_common():
         print(f"{sender}: {count} ədəd")
     
@@ -101,7 +108,7 @@ def search_emails_containing_word(mail, words=["icra", "ICRA"]):
         print(f"{ay}: {count} ədəd")
     
     # Hər ay üçün sender sayları
-    print("\nHər ay üçün göndərənlərə görə saylar (ən çoxdan az-a):")
+    print("\nHər ay üçün icazəli göndərənlərə görə saylar (ən çoxdan az-a):")
     monthly_df = pd.DataFrame(monthly_sender_summary)
     monthly_df = monthly_df.sort_values(by=['Ay', 'Say'], ascending=[False, False])
     for ay in sorted(monthly_df['Ay'].unique(), reverse=True):  # Yenidən köhnəyə
@@ -124,7 +131,7 @@ def search_emails_containing_word(mail, words=["icra", "ICRA"]):
     if email_details:
         df = pd.DataFrame(email_details)
         df = df.sort_values(by=['Ay', 'Tarix'], ascending=False)
-        excel_file = 'icra_ICRA_emails_by_month_with_sender_counts.xlsx'
+        excel_file = 'icra_case_insensitive_filtered_emails_by_month_with_sender_counts.xlsx'
         with pd.ExcelWriter(excel_file, engine='openpyxl') as writer:
             df.to_excel(writer, sheet_name='Bütün E-poçtlar', index=False)
             # Aylara görə ümumi summary sheet
@@ -139,7 +146,7 @@ def search_emails_containing_word(mail, words=["icra", "ICRA"]):
     else:
         print("\nSaxlanacaq məlumat yoxdur.")
     
-    return total_count, sender_counts, monthly_counts, monthly_sender_summary, email_details
+    return filtered_count, sender_counts, monthly_counts, monthly_sender_summary, email_details
 
 # Skripti işə sal
 try:
