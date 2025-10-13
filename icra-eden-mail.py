@@ -19,16 +19,17 @@ def connect_to_email():
     mail.select("INBOX")  # Inbox qovluğunu seç (gələn e-poçtlar)
     return mail
 
-def search_emails_containing_word(mail, word="Icra"):
-    # "Icra" sözünü ehtiva edən e-poçtları axtar (subject və ya body-də)
-    status, messages = mail.search(None, f'TEXT "{word}"')  # TEXT - subject və ya body-də axtarır
+def search_emails_containing_word(mail, words=["icra", "ICRA"]):
+    # "icra" VƏ YA "ICRA" sözlərini ehtiva edən e-poçtları axtar (subject və ya body-də, case insensitive)
+    search_criteria = ' '.join([f'TEXT "{word}"' for word in words])  # Boşluqla birləşdir (OR üçün ayrıca)
+    status, messages = mail.search(None, f'(OR {search_criteria})')
     email_ids = messages[0].split()
     
     # Email ID-lərini int-ə çevir və tərs sırala (ən yenidən köhnəyə, çünki ID-lər artan)
     sorted_ids = sorted([int(id) for id in email_ids], reverse=True)
     total_count = len(sorted_ids)
     
-    print(f"'{word}' sözünü ehtiva edən ümumi e-poçtların sayı: {total_count}")
+    print(f"'{words}' sözlərini ehtiva edən ümumi e-poçtların sayı: {total_count}")
     
     # Hər bir göndərəndən neçə e-poçt gəlib olduğunu hesabla (yalnız xarici sender-lər, sənin öz e-poçtların düşməsin)
     senders = []
@@ -123,7 +124,7 @@ def search_emails_containing_word(mail, word="Icra"):
     if email_details:
         df = pd.DataFrame(email_details)
         df = df.sort_values(by=['Ay', 'Tarix'], ascending=False)
-        excel_file = 'icra_emails_by_month_with_sender_counts.xlsx'
+        excel_file = 'icra_ICRA_emails_by_month_with_sender_counts.xlsx'
         with pd.ExcelWriter(excel_file, engine='openpyxl') as writer:
             df.to_excel(writer, sheet_name='Bütün E-poçtlar', index=False)
             # Aylara görə ümumi summary sheet
@@ -143,7 +144,7 @@ def search_emails_containing_word(mail, word="Icra"):
 # Skripti işə sal
 try:
     mail = connect_to_email()
-    total, sender_counts, monthly_counts, monthly_summary, details = search_emails_containing_word(mail, "Icra")
+    total, sender_counts, monthly_counts, monthly_summary, details = search_emails_containing_word(mail)
     mail.close()
     mail.logout()
 except Exception as e:
