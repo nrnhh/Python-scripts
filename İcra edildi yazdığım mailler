@@ -1,0 +1,158 @@
+import imaplib
+import email
+from email.header import decode_header
+from email.utils import parseaddr
+from collections import Counter
+from datetime import datetime
+import pandas as pd  # Excel üçün lazım
+
+# BMP.az IMAP konfiqurasiyası (SSL üçün port 993)
+imap_server = "mail.bmp.az"
+imap_port = 993  # SSL üçün standart
+email_address = "nuran.hasanov@bmp.az"
+password = "N2024!H"  # Sənin şifrən
+
+def connect_to_email():
+    # SSL ilə qoşul (port 993)
+    mail = imaplib.IMAP4_SSL(imap_server, imap_port)
+    mail.login(email_address, password)
+    # Sent qovluğunu yoxla (BMP.az-də "Sent" və ya "Sent Items" ola bilər)
+    try:
+        mail.select("Sent")
+        print("'Sent' qovluğu tapıldı.")
+    except Exception as select_error:
+        print(f"'Sent' qovluğu tapılmadı: {select_error}. 'Sent Items' yoxlayıram...")
+        try:
+            mail.select("Sent Items")
+            print("'Sent Items' qovluğu tapıldı.")
+        except Exception as select_error2:
+            print(f"'Sent Items' də tapılmadı: {select_error2}. BMP.az dəstəyi ilə qovluq adını yoxla!")
+            raise select_error2
+    return mail
+
+def search_emails_containing_word(mail, word="icra"):
+    # "icra" sözünü ehtiva edən e-poçtları axtar (case-insensitive TEXT axtarışı)
+    status, messages = mail.search(None, f'TEXT "{word}"')
+    email_ids = messages[0].split()
+    
+    # Email ID-lərini int-ə çevir və tərs sırala (ən yenidən köhnəyə)
+    sorted_ids = sorted([int(id) for id in email_ids], reverse=True)
+    total_count = len(sorted_ids)
+    
+    print(f"'{word}' sözünü ehtiva edən sənin göndərdiyin ümumi e-poçtların sayı (boyuk/kiçik hərflər daxil): {total_count}")
+    
+    # Sənin göndərdiyin e-poçtları topla
+    senders = []
+    email_details = []  # Detallar üçün saxla
+    for num in sorted_ids:  # Yenidən köhnəyə
+        try:
+            status, msg_data = mail.fetch(str(num), "(RFC822)")
+            msg = email.message_from_bytes(msg_data[0][1])
+            to_header = decode_header(msg["To"])[0][0]
+            if isinstance(to_header, bytes):
+                to_header = to_header.decode()
+            realname, to_email = parseaddr(to_header)
+            # Göndərən (sən) və alıcı
+            full_from = email_address  # Sənin email-in
+            full_to = f"{realname} <{to_email}>" if realname and to_email else to_email
+            senders.append(full_from)
+            # Tarix və subject
+            date_header = msg["Date"]
+            try:
+                date_obj = email.utils.parsedate_tz(date_header)
+                if date_obj:
+                    date_str = datetime(*date_obj[:6]).strftime("%Y-%m-%d %H:%M")
+                    ay = date_str[:7]  # YYYY-MM
+                else:
+                    date_str = date_header
+                    ay = "Tarix yoxdur"
+            except:
+                date_str = "Tarix yoxdur"
+                ay = "Tarix yoxdur"
+            subject = decode_header(msg["Subject"])[0][0]
+            if isinstance(subject, bytes):
+                subject = subject.decode()
+            email_details.append({
+                'Tarix': date_str,
+                'Ay': ay,
+                'Göndərən (Sən)': full_from,
+                'Alıcı': full_to,
+                'Mövzu': subject
+            })
+        except Exception as fetch_error:
+            print(f"Bu e-poçtu oxumaqda xəta (ID {num}): {fetch_error}")
+            continue
+    
+    sender_counts = Counter(senders)
+    
+    # Aylara görə saylar
+    valid_details = [d for d in email_details if d['Ay'] != "Tarix yoxdur"]
+    monthly_counts = Counter([d['Ay'] for d in valid_details])
+    
+    # Aylara görə alıcı sayları
+    monthly_recipient_summary = []
+    df_temp = pd.DataFrame(valid_details)
+    for ay, group in df_temp.groupby('Ay'):
+        ay_recipient_counts = Counter(group['Alıcı'])
+        for recipient, count in ay_recipient_counts.most_common():
+            monthly_recipient_summary.append({
+                'Ay': ay,
+                'Alıcı': recipient,
+                'Say': count
+            })
+    
+    # Nəticələri çap et
+    print("\nSənin göndərdiyin e-poçtların ümumi sayı:")
+    for sender, count in sender_counts.most_common():
+        print(f"{sender}: {count} ədəd")
+    
+    print("\nAylara görə ümumi saylar:")
+    for ay, count in monthly_counts.most_common():
+        print(f"{ay}: {count} ədəd")
+    
+    print("\nHər ay üçün alıcılara görə saylar:")
+    monthly_df = pd.DataFrame(monthly_recipient_summary)
+    monthly_df = monthly_df.sort_values(by=['Ay', 'Say'], ascending=[False, False])
+    for ay in sorted(monthly_df['Ay'].unique(), reverse=True):
+        ay_group = monthly_df[monthly_df['Ay'] == ay]
+        print(f"\n--- {ay} ayı (ümumi: {monthly_counts[ay]} ədəd) ---")
+        for _, row in ay_group.iterrows():
+            print(f"  {row['Alıcı']}: {row['Say']} ədəd")
+    
+    print("\nÜmumi siyahı:")
+    df_temp = pd.DataFrame(email_details)
+    df_temp = df_temp.sort_values(by=['Ay', 'Tarix'], ascending=False)
+    for ay, group in df_temp.groupby('Ay'):
+        if ay != "Tarix yoxdur":
+            print(f"\n--- {ay} ayı ({len(group)} ədəd) ---")
+            for _, detail in group.iterrows():
+                print(f"Tarix: {detail['Tarix']} | Alıcı: {detail['Alıcı']} | Mövzu: {detail['Mövzu']}")
+    
+    # Excel saxla
+    if email_details:
+        df = pd.DataFrame(email_details)
+        df = df.sort_values(by=['Ay', 'Tarix'], ascending=False)
+        excel_file = 'icra_sent_emails_by_month_with_recipient_counts.xlsx'
+        with pd.ExcelWriter(excel_file, engine='openpyxl') as writer:
+            df.to_excel(writer, sheet_name='Sənin Göndərdiklərin', index=False)
+            summary_df = pd.DataFrame(monthly_counts.items(), columns=['Ay', 'Say'])
+            summary_df = summary_df.sort_values(by='Say', ascending=False)
+            summary_df.to_excel(writer, sheet_name='Aylara Görə Ümumi Summary', index=False)
+            monthly_recipient_df = pd.DataFrame(monthly_recipient_summary)
+            monthly_recipient_df = monthly_recipient_df.sort_values(by=['Ay', 'Say'], ascending=[False, False])
+            monthly_recipient_df.to_excel(writer, sheet_name='Aylara Görə Alıcı Summary', index=False)
+        print(f"\nExcel saxlanıldı: {excel_file}")
+    else:
+        print("\nSaxlanacaq məlumat yoxdur.")
+    
+    return total_count, sender_counts, monthly_counts, monthly_recipient_summary, email_details
+
+# Skripti işə sal
+try:
+    mail = connect_to_email()
+    total, sender_counts, monthly_counts, monthly_summary, details = search_emails_containing_word(mail)
+    mail.close()
+    mail.logout()
+except Exception as e:
+    print(f"Xəta: {e}")
+    print("IMAP ayarlarını və şifrəni yoxla! BMP.az dəstəyi ilə əlaqə saxla!")
