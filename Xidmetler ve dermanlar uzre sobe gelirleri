@@ -1,0 +1,445 @@
+# -*- coding: utf-8 -*-
+"""
+Aylıq Dərman + Xidmət hesabatı (Oracle THICK MODE)
+- Hər ay üçün 2 sheet: "<Ay> - Dərman", "<Ay> - Xidmət"
+- "Aylıq Özet": Ay səviyyəsində
+    * Dərman Məbləğ (CƏM), Dərman EDV-siz (CƏM), Dərman İcbari
+    * Xidmət EDV-siz (Ödənişli), Xidmət EDV-siz (Sığortalı), Xidmət İcbari (CƏM)
+- "Aylıq Özet (Depo - Dərman)": Ay + Depo səviyyəsində
+    * Dərman EDV-siz (CƏM), Dərman İcbari
+- "Aylıq Özet (Şöbə - Xidmət)": Ay + Şöbə səviyyəsində
+    * Xidmət EDV-siz (Ödənişli), Xidmət İcbari (CƏM)
+- Başlıqlar rəngli, auto-fit, filter, freeze panes, CƏM sətiri, data barlar
+- Fayl varsa _1, _2, ... artıraraq yazır
+"""
+
+import os, warnings
+from datetime import date
+from dateutil.relativedelta import relativedelta
+import pandas as pd
+import oracledb
+
+# ================== PARAMETRLƏR ==================
+DB_USER = os.getenv("ORA_USER", "NURAN")                         # <-- DƏYİŞ
+DB_PASS = os.getenv("ORA_PASS", "Nuran..2024!!")                 # <-- DƏYİŞ
+DB_DSN  = os.getenv("ORA_DSN",  "172.18.79.23:1521/FONETAZ")     # <-- DƏYİŞ
+
+INSTANT_CLIENT_DIR = r"C:\instant\instantclient_23_9"  # <-- DƏYİŞ/YOXLA
+
+# Tarix aralığı (bitis EXCLUSIVE). Nümunə: Avq–Oktyabr 2025 aralığı.
+START_DATE = date(2025, 8, 1)
+END_DATE   = date(2025, 11, 1)
+
+# Çıxış faylı (əgər mövcuddursa _1, _2 ... artırılacaq)
+BASE_XLSX  = "Aylıq_Derman_Xidmet_Hesabatı.xlsx"
+
+# ================== SQL-lər ==================
+# DƏRMANLAR — ÜMUMİ məbləğ (ödənişli + icbari birlikdə), EDV-siz (CƏM), İcbari ayrıca
+SQL_DERMAN = """
+SELECT
+  TRUNC(T.TARIH,'MM') AS AY,
+  T.DEPOADI           AS DEPO,
+  COUNT(DISTINCT T.HASTA_HKID) AS XESTE_SAYI,
+
+  -- ÜMUMİ MƏBLƏĞ (ödənişli + icbari)
+  SUM(NVL(T.SNLTUTAR,0))      AS MEBLEG,
+  SUM(NVL(T.SNLTUTAR,0))/1.18 AS EDVSIZ,
+
+  -- İCBARİ AYRI
+  SUM(CASE WHEN S.HK_KURUMID = 812 THEN NVL(T.SNLTUTAR,0) ELSE 0 END) AS MEBLEG_ICBARI,
+
+  -- Məlumat üçün alış
+  SUM(NVL(T.SNLALISTUTAR,0)) AS ALIS_MEBLEGI
+
+FROM fonethbys.V_STOK_LIST_CIKISFISDETAY T
+LEFT JOIN fonethbys.H_HASTAKAYIT S ON S.HK_ID = T.HASTA_HKID
+WHERE T.FORMTYPE = 2
+  AND T.TARIH >= :p_start
+  AND T.TARIH <  :p_end
+GROUP BY TRUNC(T.TARIH,'MM'), T.DEPOADI
+ORDER BY TRUNC(T.TARIH,'MM'), T.DEPOADI
+"""
+
+# XİDMƏTLƏR — olduğu kimi saxlanılıb
+SQL_XIDMET = """
+SELECT
+  TRUNC(T.HI_TARIH,'MM') AS AY,
+  T.SR_ID                AS ID,
+  T.SR_ADI               AS ADI,
+  COUNT(DISTINCT T.HK_ID) AS XESTE_SAYI,
+  SUM(NVL(T.HI_MIKTAR,0)) AS XIDMET_SAYI,
+
+  SUM(CASE WHEN T.HK_KURUMID <> 812 THEN NVL(T.HI_HTUTAR,0) ELSE 0 END)         AS ODE_MEBLEG,
+  SUM(CASE WHEN T.HK_KURUMID <> 812 THEN NVL(T.HI_HTUTAR,0) ELSE 0 END)/1.18    AS ODE_EDVSIZ,
+
+  SUM(CASE WHEN T.HK_KURUMID <> 812 THEN NVL(T.HI_KTUTAR,0) ELSE 0 END)         AS TESK_MEBLEG,
+  SUM(CASE WHEN T.HK_KURUMID <> 812 THEN NVL(T.HI_KTUTAR,0) ELSE 0 END)/1.18    AS TESK_EDVSIZ,
+
+  SUM(CASE WHEN T.HK_KURUMID = 812 THEN NVL(T.HI_KTUTAR,0) + NVL(T.HI_HTUTAR,0) ELSE 0 END) AS ICBARI_TOPLAM
+FROM fonethbys.V_IST_GENEL_HIZMET T
+WHERE T.HI_TARIH >= :p_start
+  AND T.HI_TARIH <  :p_end
+GROUP BY TRUNC(T.HI_TARIH,'MM'), T.SR_ID, T.SR_ADI
+ORDER BY TRUNC(T.HI_TARIH,'MM'), T.SR_ADI, T.SR_ID
+"""
+
+# Excel başlıqları
+PRETTY_DERMAN = {
+    "DEPO": "Depo",
+    "XESTE_SAYI": "Xəstə sayı",
+    "MEBLEG": "Məbləğ",
+    "EDVSIZ": "EDV-siz",
+    "MEBLEG_ICBARI": "İcbari məbləğ",
+    "ALIS_MEBLEGI": "Alış məbləği",
+}
+PRETTY_XIDMET = {
+    "ID": "ID",
+    "ADI": "Şöbə adı",
+    "XESTE_SAYI": "Xəstə sayı",
+    "XIDMET_SAYI": "Xidmət sayı",
+    "ODE_MEBLEG": "Ödənişli məbləğ",
+    "ODE_EDVSIZ": "EDV-siz ödənişli",
+    "TESK_MEBLEG": "Təşkilat məbləği",
+    "TESK_EDVSIZ": "EDV-siz təşkilat",
+    "ICBARI_TOPLAM": "İcbari toplam",
+}
+
+AZ_MONTH = {
+    1:"Yanvar",2:"Fevral",3:"Mart",4:"Aprel",5:"May",6:"İyun",
+    7:"İyul",8:"Avqust",9:"Sentyabr",10:"Oktyabr",11:"Noyabr",12:"Dekabr"
+}
+
+# ================== Köməkçilər ==================
+def xl_col(idx0: int) -> str:
+    n, s = idx0, ""
+    while True:
+        n, r = divmod(n, 26)
+        s = chr(65 + r) + s
+        if n == 0: break
+        n -= 1
+    return s
+
+def autofit_columns(writer, sheet, df, extra=2):
+    ws = writer.sheets[sheet]
+    for i, c in enumerate(df.columns):
+        ser = df[c].astype(str)
+        width = max([len(c)] + ser.map(len).tolist()) if len(ser) else len(c)
+        ws.set_column(i, i, width + extra)
+
+def unique_filename(base: str) -> str:
+    root, ext = os.path.splitext(base)
+    k = 1
+    name = base
+    while os.path.exists(name):
+        name = f"{root}_{k}{ext}"
+        k += 1
+    return name
+
+# ================== Əsas ==================
+def main():
+    warnings.filterwarnings("ignore", category=UserWarning, module="pandas")
+    # Thick mode
+    oracledb.init_oracle_client(lib_dir=INSTANT_CLIENT_DIR)
+    conn = oracledb.connect(user=DB_USER, password=DB_PASS, dsn=DB_DSN)
+
+    out_xlsx = unique_filename(BASE_XLSX)
+
+    # Xülasə konteynerləri
+    summary_rows = []          # Ay səviyyəsi — Dərman + Xidmət
+    depo_summary_rows = []     # Ay + Depo — Dərman
+    sobe_summary_rows = []     # YENİ: Ay + Şöbə — Xidmət
+
+    with conn:
+        with pd.ExcelWriter(
+            out_xlsx,
+            engine="xlsxwriter",
+            engine_kwargs={"options": {"nan_inf_to_errors": True}},
+        ) as writer:
+            wb = writer.book
+            header_fmt = wb.add_format({
+                "bold": True, "font_size": 11, "bg_color": "#1F4E78",
+                "font_color": "white", "align": "center", "valign": "vcenter", "border": 1
+            })
+            int_fmt   = wb.add_format({"num_format": "#,##0", "border": 1})
+            money_fmt = wb.add_format({"num_format": "#,##0.00", "border": 1})
+            text_fmt  = wb.add_format({"border": 1})
+            total_fmt = wb.add_format({
+                "bold": True, "bg_color": "#DEEAF6", "border": 1, "num_format": "#,##0.00"
+            })
+            total_int_fmt = wb.add_format({
+                "bold": True, "bg_color": "#DEEAF6", "border": 1, "num_format": "#,##0"
+            })
+            title_fmt = wb.add_format({"bold": True, "font_size": 14})
+
+            cur = START_DATE
+            while cur < END_DATE:
+                nxt = cur + relativedelta(months=1)
+                ay_ad = AZ_MONTH[cur.month]
+
+                # --------- DƏRMANLAR (ÜMUMİ) ---------
+                derman_df = pd.read_sql(SQL_DERMAN, conn, params={"p_start": cur, "p_end": nxt}).fillna(0)
+                if "AY" in derman_df.columns: derman_df = derman_df.drop(columns=["AY"])
+                derman_df.rename(columns=PRETTY_DERMAN, inplace=True)
+
+                sheet_der = f"{ay_ad} - Dərman"
+                derman_df.to_excel(writer, sheet_name=sheet_der, index=False, startrow=2)
+                ws = writer.sheets[sheet_der]
+                ws.write(0, 0, f"{ay_ad} ayı — Dərmanlar", title_fmt)
+                ws.write(1, 0, f"Tarix aralığı: {cur.strftime('%d.%m.%Y')} – {(nxt - relativedelta(days=1)).strftime('%d.%m.%Y')}")
+
+                for i, col in enumerate(derman_df.columns): ws.write(2, i, col, header_fmt)
+
+                nrows = len(derman_df)
+                for r in range(nrows):
+                    ws.set_row(3 + r, 18)
+                    for c, name in enumerate(derman_df.columns):
+                        val = derman_df.iloc[r, c]
+                        if name == "Xəstə sayı":
+                            ws.write(3 + r, c, val, int_fmt)
+                        elif name in ("Məbləğ", "EDV-siz", "İcbari məbləğ", "Alış məbləği"):
+                            ws.write(3 + r, c, val, money_fmt)
+                        else:
+                            ws.write(3 + r, c, val, text_fmt)
+
+                total_row = 3 + nrows
+                if nrows > 0:
+                    ws.write(total_row, 0, "CƏM", total_int_fmt)
+                    idx = {c: i for i, c in enumerate(derman_df.columns)}
+                    if "Depo" in idx: ws.write(total_row, idx["Depo"], "", total_int_fmt)
+                    if "Xəstə sayı" in idx:
+                        c = idx["Xəstə sayı"]; ws.write_formula(total_row, c, f"=SUM({xl_col(c)}4:{xl_col(c)}{3+nrows})", total_int_fmt)
+                    for k in ("Məbləğ", "EDV-siz", "İcbari məbləğ", "Alış məbləği"):
+                        if k in idx:
+                            c = idx[k]; ws.write_formula(total_row, c, f"=SUM({xl_col(c)}4:{xl_col(c)}{3+nrows})", total_fmt)
+
+                autofit_columns(writer, sheet_der, derman_df)
+                ws.autofilter(2, 0, max(2 + nrows, 3), len(derman_df.columns) - 1)
+                ws.freeze_panes(3, 0)
+                if nrows > 1:
+                    for k in ("Məbləğ", "EDV-siz", "İcbari məbləğ", "Alış məbləği"):
+                        if k in derman_df.columns:
+                            c = derman_df.columns.get_loc(k)
+                            ws.conditional_format(3, c, 2 + nrows, c, {"type": "data_bar"})
+
+                # --------- XİDMƏTLƏR (DƏYİŞMƏZ) ---------
+                xidmet_df = pd.read_sql(SQL_XIDMET, conn, params={"p_start": cur, "p_end": nxt}).fillna(0)
+                if "AY" in xidmet_df.columns: xidmet_df = xidmet_df.drop(columns=["AY"])
+                xidmet_df.rename(columns=PRETTY_XIDMET, inplace=True)
+
+                sheet_xid = f"{ay_ad} - Xidmət"
+                xidmet_df.to_excel(writer, sheet_name=sheet_xid, index=False, startrow=2)
+                ws2 = writer.sheets[sheet_xid]
+                ws2.write(0, 0, f"{ay_ad} ayı — Xidmətlər", title_fmt)
+                ws2.write(1, 0, f"Tarix aralığı: {cur.strftime('%d.%m.%Y')} – {(nxt - relativedelta(days=1)).strftime('%d.%m.%Y')}")
+
+                for i, col in enumerate(xidmet_df.columns): ws2.write(2, i, col, header_fmt)
+
+                nrows2 = len(xidmet_df)
+                for r in range(nrows2):
+                    ws2.set_row(3 + r, 18)
+                    for c, name in enumerate(xidmet_df.columns):
+                        val = xidmet_df.iloc[r, c]
+                        if name in ("Xəstə sayı","Xidmət sayı"):
+                            ws2.write(3 + r, c, val, int_fmt)
+                        elif name in ("Ödənişli məbləğ","EDV-siz ödənişli","Təşkilat məbləği","EDV-siz təşkilat","İcbari toplam"):
+                            ws2.write(3 + r, c, val, money_fmt)
+                        else:
+                            ws2.write(3 + r, c, val, text_fmt)
+
+                total_row2 = 3 + nrows2
+                if nrows2 > 0:
+                    ws2.write(total_row2, 0, "CƏM", total_int_fmt)
+                    idx2 = {c: i for i, c in enumerate(xidmet_df.columns)}
+                    for k in ("ID","Şöbə adı"):
+                        if k in idx2: ws2.write(total_row2, idx2[k], "", total_int_fmt)
+                    if "Xəstə sayı" in idx2:
+                        c = idx2["Xəstə sayı"]; ws2.write_formula(total_row2, c, f"=SUM({xl_col(c)}4:{xl_col(c)}{3+nrows2})", total_int_fmt)
+                    if "Xidmət sayı" in idx2:
+                        c = idx2["Xidmət sayı"]; ws2.write_formula(total_row2, c, f"=SUM({xl_col(c)}4:{xl_col(c)}{3+nrows2})", total_int_fmt)
+                    for k in ("Ödənişli məbləğ","EDV-siz ödənişli","Təşkilat məbləği","EDV-siz təşkilat","İcbari toplam"):
+                        if k in idx2:
+                            c = idx2[k]; ws2.write_formula(total_row2, c, f"=SUM({xl_col(c)}4:{xl_col(c)}{3+nrows2})", total_fmt)
+
+                autofit_columns(writer, sheet_xid, xidmet_df)
+                ws2.autofilter(2, 0, max(2 + nrows2, 3), len(xidmet_df.columns) - 1)
+                ws2.freeze_panes(3, 0)
+                if nrows2 > 1:
+                    for k in ("Ödənişli məbləğ","EDV-siz ödənişli","Təşkilat məbləği","EDV-siz təşkilat","İcbari toplam"):
+                        if k in xidmet_df.columns:
+                            c = xidmet_df.columns.get_loc(k)
+                            ws2.conditional_format(3, c, 2 + nrows2, c, {"type": "data_bar"})
+
+                # --------- AYLIK ÖZET (Dərman + Xidmət) ---------
+                # Dərman (ay səviyyəsi)
+                derman_mebleg_cem = float(derman_df["Məbləğ"].sum()) if "Məbləğ" in derman_df.columns else 0.0
+                derman_edvsiz_cem = float(derman_df["EDV-siz"].sum()) if "EDV-siz" in derman_df.columns else 0.0
+                derman_icbari     = float(derman_df["İcbari məbləğ"].sum()) if "İcbari məbləğ" in derman_df.columns else 0.0
+                # Xidmət (ay səviyyəsi)
+                xidmet_edvsiz_odenisli = float(xidmet_df["EDV-siz ödənişli"].sum()) if "EDV-siz ödənişli" in xidmet_df.columns else 0.0
+                icbari_toplam          = float(xidmet_df["İcbari toplam"].sum()) if "İcbari toplam" in xidmet_df.columns else 0.0
+                xidmet_edvsiz_sigortali = icbari_toplam / 1.18 if icbari_toplam else 0.0
+                xidmet_icbari_cem       = icbari_toplam  # brüt icbari
+
+                summary_rows.append({
+                    "Ay": ay_ad,
+                    "Dərman Məbləğ (CƏM)": derman_mebleg_cem,
+                    "Dərman EDV-siz (CƏM)": derman_edvsiz_cem,
+                    "Dərman İcbari": derman_icbari,
+                    "Xidmət EDV-siz (Ödənişli)": xidmet_edvsiz_odenisli,
+                    "Xidmət EDV-siz (Sığortalı)": xidmet_edvsiz_sigortali,
+                    "Xidmət İcbari (CƏM)": xidmet_icbari_cem,
+                })
+
+                # --------- DEPO ÖZETİ (Ay + Depo - Dərman) ---------
+                if not derman_df.empty:
+                    dgrp = derman_df.groupby("Depo", as_index=False).agg({
+                        "EDV-siz": "sum",
+                        "İcbari məbləğ": "sum"
+                    })
+                    dgrp.rename(columns={
+                        "EDV-siz": "Dərman EDV-siz (CƏM)",
+                        "İcbari məbləğ": "Dərman İcbari"
+                    }, inplace=True)
+                    dgrp.insert(0, "Ay", ay_ad)
+                    depo_summary_rows.append(dgrp)
+
+                # --------- ŞÖBƏ ÖZETİ (Ay + Şöbə - Xidmət) — YENİ ---------
+                if not xidmet_df.empty:
+                    sgrp = xidmet_df.groupby("Şöbə adı", as_index=False).agg({
+                        "EDV-siz ödənişli": "sum",
+                        "İcbari toplam": "sum",
+                    })
+                    sgrp.rename(columns={
+                        "EDV-siz ödənişli": "Xidmət EDV-siz (Ödənişli)",
+                        "İcbari toplam": "Xidmət İcbari (CƏM)",
+                    }, inplace=True)
+                    sgrp.insert(0, "Ay", ay_ad)
+                    sobe_summary_rows.append(sgrp)
+
+                # növbəti ay
+                cur = nxt
+
+            # --------- Aylıq ÖZET (Dərman + Xidmət) ---------
+            summary_df = pd.DataFrame(summary_rows, columns=[
+                "Ay",
+                "Dərman Məbləğ (CƏM)",
+                "Dərman EDV-siz (CƏM)",
+                "Dərman İcbari",
+                "Xidmət EDV-siz (Ödənişli)",
+                "Xidmət EDV-siz (Sığortalı)",
+                "Xidmət İcbari (CƏM)"
+            ]).fillna(0)
+
+            sheet_sum = "Aylıq Özet"
+            summary_df.to_excel(writer, sheet_name=sheet_sum, index=False, startrow=2)
+            ws = writer.sheets[sheet_sum]
+            ws.write(0, 0, "Aylıq Yekun Özet — Dərman + Xidmət", title_fmt)
+            ws.write(1, 0, f"Aralıq: {START_DATE.strftime('%d.%m.%Y')} – {(END_DATE - relativedelta(days=1)).strftime('%d.%m.%Y')}")
+
+            for i, col in enumerate(summary_df.columns): ws.write(2, i, col, header_fmt)
+
+            nrows = len(summary_df)
+            for r in range(nrows):
+                ws.set_row(3 + r, 18)
+                for c, name in enumerate(summary_df.columns):
+                    val = summary_df.iloc[r, c]
+                    if name == "Ay": ws.write(3 + r, c, val, text_fmt)
+                    else:            ws.write(3 + r, c, val, money_fmt)
+
+            total_row = 3 + nrows
+            if nrows > 0:
+                ws.write(total_row, 0, "CƏM", total_int_fmt)
+                for cname in summary_df.columns[1:]:
+                    c = summary_df.columns.get_loc(cname)
+                    ws.write_formula(total_row, c, f"=SUM({xl_col(c)}4:{xl_col(c)}{3+nrows})", total_fmt)
+
+            autofit_columns(writer, sheet_sum, summary_df)
+            ws.autofilter(2, 0, max(2 + nrows, 3), len(summary_df.columns) - 1)
+            ws.freeze_panes(3, 1)
+            if nrows > 1:
+                for cname in summary_df.columns[1:]:
+                    c = summary_df.columns.get_loc(cname)
+                    ws.conditional_format(3, c, 2 + nrows, c, {"type": "data_bar"})
+
+            # --------- Aylıq ÖZET (Depo - Dərman) ---------
+            if depo_summary_rows:
+                depo_df = pd.concat(depo_summary_rows, ignore_index=True)
+                depo_df = depo_df[["Ay", "Depo", "Dərman EDV-siz (CƏM)", "Dərman İcbari"]]
+
+                sheet_depo = "Aylıq Özet (Depo - Dərman)"
+                depo_df.to_excel(writer, sheet_name=sheet_depo, index=False, startrow=2)
+                wsd = writer.sheets[sheet_depo]
+                wsd.write(0, 0, "Aylıq Yekun Özet — Depo üzrə (Dərman)", title_fmt)
+                wsd.write(1, 0, f"Aralıq: {START_DATE.strftime('%d.%m.%Y')} – {(END_DATE - relativedelta(days=1)).strftime('%d.%m.%Y')}")
+
+                for i, col in enumerate(depo_df.columns): wsd.write(2, i, col, header_fmt)
+
+                nrd = len(depo_df)
+                for r in range(nrd):
+                    wsd.set_row(3 + r, 18)
+                    for c, name in enumerate(depo_df.columns):
+                        val = depo_df.iloc[r, c]
+                        if name in ("Dərman EDV-siz (CƏM)", "Dərman İcbari"):
+                            wsd.write(3 + r, c, val, money_fmt)
+                        else:
+                            wsd.write(3 + r, c, val, text_fmt)
+
+                total_row = 3 + nrd
+                if nrd > 0:
+                    wsd.write(total_row, 0, "CƏM", total_int_fmt)
+                    wsd.write(total_row, 1, "", total_int_fmt)  # Depo üçün vizual boş
+                    for cname in ("Dərman EDV-siz (CƏM)", "Dərman İcbari"):
+                        c = depo_df.columns.get_loc(cname)
+                        wsd.write_formula(total_row, c, f"=SUM({xl_col(c)}4:{xl_col(c)}{3+nrd})", total_fmt)
+
+                autofit_columns(writer, sheet_depo, depo_df)
+                wsd.autofilter(2, 0, max(2 + nrd, 3), len(depo_df.columns) - 1)
+                wsd.freeze_panes(3, 1)
+                if nrd > 1:
+                    for cname in ("Dərman EDV-siz (CƏM)", "Dərman İcbari"):
+                        c = depo_df.columns.get_loc(cname)
+                        wsd.conditional_format(3, c, 2 + nrd, c, {"type": "data_bar"})
+
+            # --------- Aylıq ÖZET (Şöbə - Xidmət) — YENİ ---------
+            if sobe_summary_rows:
+                sobe_df = pd.concat(sobe_summary_rows, ignore_index=True)
+                sobe_df = sobe_df[["Ay", "Şöbə adı", "Xidmət EDV-siz (Ödənişli)", "Xidmət İcbari (CƏM)"]]
+
+                sheet_sobe = "Aylıq Özet (Şöbə - Xidmət)"
+                sobe_df.to_excel(writer, sheet_name=sheet_sobe, index=False, startrow=2)
+                wss = writer.sheets[sheet_sobe]
+                wss.write(0, 0, "Aylıq Yekun Özet — Şöbə üzrə (Xidmət)", title_fmt)
+                wss.write(1, 0, f"Aralıq: {START_DATE.strftime('%d.%m.%Y')} – {(END_DATE - relativedelta(days=1)).strftime('%d.%m.%Y')}")
+
+                for i, col in enumerate(sobe_df.columns): wss.write(2, i, col, header_fmt)
+
+                nrs = len(sobe_df)
+                for r in range(nrs):
+                    wss.set_row(3 + r, 18)
+                    for c, name in enumerate(sobe_df.columns):
+                        val = sobe_df.iloc[r, c]
+                        if name in ("Xidmət EDV-siz (Ödənişli)", "Xidmət İcbari (CƏM)"):
+                            wss.write(3 + r, c, val, money_fmt)
+                        else:
+                            wss.write(3 + r, c, val, text_fmt)
+
+                total_row = 3 + nrs
+                if nrs > 0:
+                    wss.write(total_row, 0, "CƏM", total_int_fmt)
+                    wss.write(total_row, 1, "", total_int_fmt)  # Şöbə adı üçün vizual boş
+                    for cname in ("Xidmət EDV-siz (Ödənişli)", "Xidmət İcbari (CƏM)"):
+                        c = sobe_df.columns.get_loc(cname)
+                        wss.write_formula(total_row, c, f"=SUM({xl_col(c)}4:{xl_col(c)}{3+nrs})", total_fmt)
+
+                autofit_columns(writer, sheet_sobe, sobe_df)
+                wss.autofilter(2, 0, max(2 + nrs, 3), len(sobe_df.columns) - 1)
+                wss.freeze_panes(3, 1)
+                if nrs > 1:
+                    for cname in ("Xidmət EDV-siz (Ödənişli)", "Xidmət İcbari (CƏM)"):
+                        c = sobe_df.columns.get_loc(cname)
+                        wss.conditional_format(3, c, 2 + nrs, c, {"type": "data_bar"})
+
+    print(f"✅ Fayl yaradıldı: {out_xlsx}")
+
+if __name__ == "__main__":
+    main()
