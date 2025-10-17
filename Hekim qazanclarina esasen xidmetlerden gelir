@@ -1,0 +1,183 @@
+# -*- coding: utf-8 -*-
+import os, warnings
+from datetime import date
+from dateutil.relativedelta import relativedelta
+import pandas as pd
+import oracledb
+
+# ----------------- Parametrlər -----------------
+DB_USER = os.getenv("ORA_USER", "NURAN")                     # <-- DƏYİŞ
+DB_PASS = os.getenv("ORA_PASS", "Nuran..2024!!")             # <-- DƏYİŞ
+DB_DSN  = os.getenv("ORA_DSN",  "172.18.79.23:1521/FONETAZ") # <-- DƏYİŞ
+
+INSTANT_CLIENT_DIR =  r"C:\instant\instantclient_23_9"
+
+START_DATE = date(2025, 1, 1)
+END_DATE   = date(2025, 12, 1)
+
+BASE_XLSX  = "Hekim_Hakedis_Aylıq.xlsx"
+
+# ----------------- SQL (qısa aliaslarla) -----------------
+SQL = """
+SELECT
+  t.P_ADSOYAD                       AS HEKIM_ADI,
+  t.SR_ADI                          AS SOBE_ADI,
+  COUNT(DISTINCT t.HK_ID)           AS XESTE_SAYI,
+  SUM(t.HI_TUTAR)                   AS UMUMI_XIDMET_MEB,
+  SUM(CASE WHEN t.HS_ID = '1' THEN t.HI_TUTAR ELSE 0 END) AS ODENISLI_MEB,
+  SUM(CASE WHEN t.HS_ID = '2' THEN t.HI_TUTAR ELSE 0 END) AS SIGORTALI_MEB,
+  SUM(t.HAKTUTAR)                   AS HEKIM_QAZANC
+FROM fonethbys.V_HAKEDIS_RAPOR t
+WHERE t.HI_TARIH >= :p_start
+  AND t.HI_TARIH <  :p_end
+GROUP BY t.P_ADSOYAD, t.SR_ADI
+ORDER BY t.SR_ADI, t.P_ADSOYAD
+"""
+
+PRETTY_COLS = {
+    "HEKIM_ADI": "Həkim adı",
+    "SOBE_ADI": "Şöbə adı",
+    "XESTE_SAYI": "Xəstə sayı",
+    "UMUMI_XIDMET_MEB": "Ümumi xidmət məbləği",
+    "ODENISLI_MEB": "Ödənişli xidmət məbləği",
+    "SIGORTALI_MEB": "Sığortalı xidmət məbləği",
+    "HEKIM_QAZANC": "Həkim qazancı",
+}
+
+# ----------------- Köməkçi funksiyalar -----------------
+def xl_col(idx0: int) -> str:
+    n = idx0
+    s = ""
+    while True:
+        n, r = divmod(n, 26)
+        s = chr(65 + r) + s
+        if n == 0:
+            break
+        n -= 1
+    return s
+
+def autofit_columns(writer, sheet, df, extra=2):
+    ws = writer.sheets[sheet]
+    for i, c in enumerate(df.columns):
+        ser = df[c].astype(str)
+        width = max([len(c)] + ser.map(len).tolist()) if len(ser) else len(c)
+        ws.set_column(i, i, width + extra)
+
+def unique_filename(base: str) -> str:
+    """
+    Eyni adda fayl varsa, avtomatik olaraq _1, _2, ... artıraraq yeni ad qaytarır.
+    """
+    root, ext = os.path.splitext(base)
+    counter = 1
+    new_name = base
+    while os.path.exists(new_name):
+        new_name = f"{root}_{counter}{ext}"
+        counter += 1
+    return new_name
+
+# ----------------- Əsas kod -----------------
+def main():
+    warnings.filterwarnings("ignore", category=UserWarning, module="pandas")
+
+    oracledb.init_oracle_client(lib_dir=INSTANT_CLIENT_DIR)
+    conn = oracledb.connect(user=DB_USER, password=DB_PASS, dsn=DB_DSN)
+
+    # Fayl adını unikal seç (əgər mövcuddursa artır)
+    out_xlsx = unique_filename(BASE_XLSX)
+
+    with conn:
+        with pd.ExcelWriter(
+            out_xlsx,
+            engine="xlsxwriter",
+            engine_kwargs={"options": {"nan_inf_to_errors": True}},
+        ) as writer:
+            wb = writer.book
+
+            # Formatlar
+            header_fmt = wb.add_format({
+                "bold": True, "font_size": 11, "bg_color": "#1F4E78",
+                "font_color": "white", "align": "center", "valign": "vcenter", "border": 1
+            })
+            int_fmt   = wb.add_format({"num_format": "#,##0", "border": 1})
+            money_fmt = wb.add_format({"num_format": "#,##0.00", "border": 1})
+            text_fmt  = wb.add_format({"border": 1})
+            total_fmt = wb.add_format({
+                "bold": True, "bg_color": "#DEEAF6", "border": 1, "num_format": "#,##0.00"
+            })
+            total_int_fmt = wb.add_format({
+                "bold": True, "bg_color": "#DEEAF6", "border": 1, "num_format": "#,##0"
+            })
+            title_fmt = wb.add_format({"bold": True, "font_size": 14})
+
+            az_map = {
+                1:"Yanvar",2:"Fevral",3:"Mart",4:"Aprel",5:"May",6:"İyun",
+                7:"İyul",8:"Avqust",9:"Sentyabr",10:"Oktyabr",11:"Noyabr",12:"Dekabr"
+            }
+
+            cur = START_DATE
+            while cur < END_DATE:
+                nxt = cur + relativedelta(months=1)
+                sheet = az_map[cur.month]
+
+                df = pd.read_sql(SQL, conn, params={"p_start": cur, "p_end": nxt}).fillna(0)
+                df.rename(columns=PRETTY_COLS, inplace=True)
+
+                df.to_excel(writer, sheet_name=sheet, index=False, startrow=2)
+                ws = writer.sheets[sheet]
+
+                ws.write(0, 0, f"{sheet} ayı həkim hakediş statistikası", title_fmt)
+                ws.write(1, 0, f"Tarix aralığı: {cur.strftime('%d.%m.%Y')} – {(nxt - relativedelta(days=1)).strftime('%d.%m.%Y')}")
+
+                # Başlıqlar
+                for i, col in enumerate(df.columns):
+                    ws.write(2, i, col, header_fmt)
+
+                # Hüceyrə formatı
+                nrows = len(df)
+                for r in range(nrows):
+                    ws.set_row(3 + r, 18)
+                    for c, name in enumerate(df.columns):
+                        val = df.iloc[r, c]
+                        if name == "Xəstə sayı":
+                            ws.write(3 + r, c, val, int_fmt)
+                        elif name in ("Ümumi xidmət məbləği",
+                                      "Ödənişli xidmət məbləği",
+                                      "Sığortalı xidmət məbləği",
+                                      "Həkim qazancı"):
+                            ws.write(3 + r, c, val, money_fmt)
+                        else:
+                            ws.write(3 + r, c, val, text_fmt)
+
+                # CƏM
+                total_row = 3 + nrows
+                if nrows > 0:
+                    ws.write(total_row, 0, "CƏM", total_int_fmt)
+                    idx = {c: i for i, c in enumerate(df.columns)}
+                    for k in ("Həkim adı", "Şöbə adı"):
+                        if k in idx:
+                            ws.write(total_row, idx[k], "", total_int_fmt)
+
+                    def sum_col(colname, fmt):
+                        c = idx[colname]
+                        ws.write_formula(total_row, c, f"=SUM({xl_col(c)}4:{xl_col(c)}{3+nrows})", fmt)
+
+                    if "Xəstə sayı" in idx: sum_col("Xəstə sayı", total_int_fmt)
+                    for k in ("Ümumi xidmət məbləği","Ödənişli xidmət məbləği","Sığortalı xidmət məbləği","Həkim qazancı"):
+                        if k in idx: sum_col(k, total_fmt)
+
+                autofit_columns(writer, sheet, df)
+                ws.autofilter(2, 0, max(2 + nrows, 3), len(df.columns) - 1)
+                ws.freeze_panes(3, 0)
+                if nrows > 1:
+                    for k in ("Ümumi xidmət məbləği","Ödənişli xidmət məbləği","Sığortalı xidmət məbləği","Həkim qazancı"):
+                        if k in df.columns:
+                            c = df.columns.get_loc(k)
+                            ws.conditional_format(3, c, 2 + nrows, c, {"type": "data_bar"})
+
+                cur = nxt
+
+    print(f"✅ Fayl yaradıldı: {out_xlsx}")
+
+
+if __name__ == "__main__":
+    main()
