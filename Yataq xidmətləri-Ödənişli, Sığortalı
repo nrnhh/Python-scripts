@@ -1,0 +1,275 @@
+# -*- coding: utf-8 -*-
+import oracledb
+import pandas as pd
+import os
+import logging
+from openpyxl import Workbook
+from openpyxl.utils import get_column_letter
+from openpyxl.styles import Alignment, PatternFill, Border, Side, Font
+import sys
+import traceback
+from itertools import groupby
+import re
+
+# ------------------------- LOGGING -------------------------
+logging.basicConfig(
+    format='%(asctime)s | %(levelname)s | %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger("yataq-xidmetleri-rapor")
+
+# ------------------------- KONFİQURASİYA -------------------------
+username = "NURAN"
+password = "Nuran..2024!!"
+dsn      = "172.18.79.23:1521/FONETAZ"
+oracle_client_path = r"C:\instant\instantclient_23_9"
+
+# Çıxış faylı
+base_output_path = os.path.join(os.path.expanduser("~"), "Desktop", "yataq_xidmetleri_raport.xlsx")
+
+# Ay adı və rənglər (Bütün 12 ayı əhatə edir)
+MONTH_ORDER = ['2025-01', '2025-02', '2025-03', '2025-04', '2025-05', '2025-06',
+               '2025-07', '2025-08', '2025-09', '2025-10', '2025-11', '2025-12']
+MONTH_NAME  = {'2025-01':'Yanvar', '2025-02':'Fevral', '2025-03':'Mart', '2025-04':'Aprel',
+               '2025-05':'May', '2025-06':'İyun', '2025-07':'İyul', '2025-08':'Avqust',
+               '2025-09':'Sentyabr', '2025-10':'Oktyabr', '2025-11':'Noyabr', '2025-12':'Dekabr'}
+# Rəngləri daha müxtəlif seçmək üçün
+MONTH_COLOR = {'2025-01':"C2E0FF", '2025-02':"D9C2F5", '2025-03':"C8F0D8", '2025-04':"FFF0C2",
+               '2025-05':"E0E0F5", '2025-06':"C2E0FF", '2025-07':"D9C2F5", '2025-08':"C8F0D8",
+               '2025-09':"FFF0C2", '2025-10':"E0E0F5", '2025-11':"C2E0FF", '2025-12':"D9C2F5"}
+
+# Xəstə sinifləri
+CLASS_ORDER = [
+    'Ödənişli Xəstələr','Sigorta Xəstələri','Dövlet Teşkilatları','Gönderen Hekim Teşkilatları',
+    'Baku Medical Plaza (işçilər)','Savitar Group','BMP 100%','Korparativ','Bmp açılış günü','Sosial Tərəfdaş','Digər'
+]
+
+# Metriklər
+METRICS = ['SAY']
+METRIC_TEXT = {'SAY': 'Xidmət miqdarı'}
+
+# ------------------------- SQL QUERY (IS_ID üzrə qruplaşdırma və SUM(NVL(HI_MIKTAR, 0)) ilə düzəliş edildi) -------------------------
+NEW_PIVOT_SQL_QUERY = r"""
+SELECT
+    TO_CHAR(TRUNC(t.HI_TARIH,'MM'),'YYYY-MM') AS Ay,
+    CASE t.HK_HSINIFID
+      WHEN 1 THEN 'Ödənişli Xəstələr'
+      WHEN 2 THEN 'Sigorta Xəstələri'
+      WHEN 5 THEN 'Dövlet Teşkilatları'
+      WHEN 6 THEN 'Gönderen Hekim Teşkilatları'
+      WHEN 8 THEN 'Baku Medical Plaza (işçilər)'
+      WHEN 11 THEN 'Savitar Group'
+      WHEN 12 THEN 'BMP 100%'
+      WHEN 13 THEN 'Korparativ'
+      WHEN 14 THEN 'Bmp açılış günü'
+      WHEN 15 THEN 'Sosial Tərəfdaş'
+      ELSE 'Digər'
+    END AS Sinif_Adi,
+    t.IS_ID,      -- Qruplaşdırma üçün İşləm ID-si
+    t.IS_ADI AS XIDMET_ADI, -- Hesabatda göstərmək üçün İşləm Adı
+    SUM(NVL(t.HI_MIKTAR, 0)) AS SAY -- Miqdarın cəmi, NULL dəyərlər 0 olaraq qəbul edildi
+FROM fonethbys.V_IST_GENEL_HIZMET t
+WHERE t.HI_TARIH >= DATE '2025-01-01'
+  AND t.HI_TARIH <  DATE '2026-01-01'
+  AND t.IT_ID = 96
+GROUP BY 
+    TO_CHAR(TRUNC(t.HI_TARIH,'MM'),'YYYY-MM'),
+    t.HK_HSINIFID,
+    t.IS_ID,      
+    t.IS_ADI      
+ORDER BY 
+    XIDMET_ADI, Ay, Sinif_Adi
+"""
+
+# ------------------------- YARDIMÇI FUNKSİYALAR -------------------------
+def initialize_oracle_client(client_path: str):
+    if not os.path.exists(client_path):
+        print(f"❌ Oracle Instant Client yolu tapılmadı: {client_path}")
+        sys.exit(1)
+    oracledb.init_oracle_client(lib_dir=client_path)
+    logger.info(f"Oracle Instant Client başladıldı: {client_path}")
+
+def get_unique_output_path(base_path: str) -> str:
+    if not os.path.exists(base_path):
+        return base_path
+    base, ext = os.path.splitext(base_path)
+    i = 1
+    while True:
+        cand = f"{base}_{i}{ext}"
+        if not os.path.exists(cand):
+            return cand
+        i += 1
+
+def sanitize_sheet_name(name: str) -> str:
+    name = re.sub(r'[\[\]\*?:/\\]', '_', name)
+    return (name or "Sheet")[:31]
+
+def get_scalar(val, default=None):
+    try:
+        if isinstance(val, pd.Series):
+            return val.iloc[0] if not val.empty else default
+        if hasattr(val, "item"):
+            try:
+                return val.item()
+            except Exception:
+                return val
+        return val if val is not None else default
+    except Exception:
+        return val if val is not None else default
+
+
+# ------------------------- EXCEL YAZIMI -------------------------
+def write_xidmet_sheet_with_multiheader(workbook: Workbook, sheet_name: str,
+                                        wide_df: pd.DataFrame, ordered_cols: list):
+    """Yataq xidməti hesabatı üçün mürəkkəb başlıqla yazma funksiyası."""
+    if sheet_name in workbook.sheetnames:
+        workbook.remove(workbook[sheet_name])
+    ws = workbook.create_sheet(title=sanitize_sheet_name(sheet_name))
+
+    center = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    left   = Alignment(horizontal='left',   vertical='center', wrap_text=True)
+    right  = Alignment(horizontal='right', vertical='center')
+    bold   = Font(bold=True)
+    title_font = Font(bold=True, size=14)
+    thin   = Border(left=Side(style='thin'), right=Side(style='thin'),
+                    top=Side(style='thin'),  bottom=Side(style='thin'))
+
+    # Title Row
+    title = f"YATAQ XİDMƏTLƏRİ HESABATI – Ay → Xəstə Sinifi"
+    total_cols = 2 + len(ordered_cols)
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=max(2, total_cols))
+    c = ws.cell(row=1, column=1, value=title); c.alignment = center; c.font = title_font
+    c.fill = PatternFill(start_color="DDEBF7", end_color="DDEBF7", fill_type="solid")
+
+    # Base Headers
+    base_headers = ['No','Xidmət Adı']
+    for i, h in enumerate(base_headers, 1):
+        ws.merge_cells(start_row=2, start_column=i, end_row=3, end_column=i)
+        cell = ws.cell(row=2, column=i, value=h)
+        cell.alignment = center; cell.font = bold
+        cell.fill = PatternFill(start_color="E6E6E6", end_color="E6E6E6", fill_type="solid")
+        cell.border = thin
+
+    # Dynamic Headers (Ay ve Sinif)
+    col = 3
+    for ay, group_by_ay in groupby(ordered_cols, key=lambda t: t[0]):
+        group_by_ay = list(group_by_ay)
+        ay_span = len(group_by_ay)
+        if ay_span > 0:
+            ws.merge_cells(start_row=2, start_column=col, end_row=2, end_column=col + ay_span - 1)
+            c1 = ws.cell(row=2, column=col, value=MONTH_NAME.get(ay, ay))
+            c1.alignment = center; c1.font = bold
+            c1.fill = PatternFill(start_color=MONTH_COLOR.get(ay, "FFFFFF"), end_color=MONTH_COLOR.get(ay, "FFFFFF"), fill_type="solid")
+        
+        for ay_val, sinif_val in group_by_ay:
+            # Sətr 3: Xəstə Sinifləri
+            c3 = ws.cell(row=3, column=col, value=sinif_val)
+            c3.alignment = center; c3.font = bold; c3.border = thin
+            c3.fill = PatternFill(start_color=MONTH_COLOR.get(ay_val, "FFFFFF"), end_color=MONTH_COLOR.get(ay_val, "FFFFFF"), fill_type="solid")
+            col += 1
+
+    # Data Rows
+    start_row = 4
+    ws.column_dimensions['A'].width = 6
+    ws.column_dimensions['B'].width = 50 # Xidmət Adı üçün genişlik
+
+    for ridx, r in wide_df.iterrows():
+        rr = start_row + ridx
+        xidmet_adi = get_scalar(r.get('XIDMET_ADI', ''), '')
+        
+        ws.cell(row=rr, column=1, value=ridx + 1).alignment = center; ws.cell(row=rr, column=1).border = thin
+        ws.cell(row=rr, column=2, value=str(xidmet_adi)).alignment = left;    ws.cell(row=rr, column=2).border = thin
+
+        ccol = 3
+        for tup in ordered_cols:
+            val = r.get(tup, 0); val = get_scalar(val, 0)
+            try: val = int(val)
+            except: pass
+            ws.cell(row=rr, column=ccol, value=val).alignment = right
+            ws.cell(row=rr, column=ccol).border = thin
+            ccol += 1
+
+    # Apply border to all cells
+    max_row = start_row + len(wide_df) - 1
+    max_col = 2 + len(ordered_cols)
+    for rr in range(2, max_row + 1):
+        for cc in range(1, max_col + 1):
+            ws.cell(row=rr, column=cc).border = thin
+
+    # Adjust column widths for data
+    for cc in range(3, max_col + 1):
+        ws.column_dimensions[get_column_letter(cc)].width = 15
+
+    ws.freeze_panes = 'C4'
+
+
+# ------------------------- HESABAT GENERATORU -------------------------
+def generate_report():
+    try:
+        initialize_oracle_client(oracle_client_path)
+
+        output_path = get_unique_output_path(base_output_path)
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+        logger.info("Yataq xidmətləri hesabatı işlədilir...")
+        with oracledb.connect(user=username, password=password, dsn=dsn) as conn:
+            # SQL sorğusunu V_IST_GENEL_HIZMET view-undan işlədirik
+            df = pd.read_sql(NEW_PIVOT_SQL_QUERY, con=conn)
+
+        if df.empty:
+            logger.warning("Sorğu boş nəticə qaytardı.")
+            print("⚠️ Heç bir sətir tapılmadı. Fayl yaradılmadı.")
+            return
+
+        df = df.rename(columns=str.upper)
+
+        # Pandas'da pivot əməliyyatı
+        # Qeyd: İndeksə həm IS_ID, həm də XIDMET_ADI daxil edilir.
+        wide = pd.pivot_table(
+            df,
+            index=['IS_ID', 'XIDMET_ADI'], 
+            columns=['AY','SINIF_ADI'],
+            values=['SAY'], 
+            aggfunc='sum',
+            fill_value=0
+        )
+        
+        # "SAY" metrik səviyyəsini silirik.
+        wide.columns = wide.columns.droplevel(0)
+        
+        # Məqsədəuyğun sıralanmış sütunların siyahısını yaradırıq
+        existing_cols = set(wide.columns.tolist())
+        ordered_cols = []
+        for ay in MONTH_ORDER:
+            for cls in CLASS_ORDER:
+                probe = (ay, cls)
+                if probe in existing_cols:
+                    ordered_cols.append(probe)
+        
+        # Bütün məlumatları başlanğıc sütunlara görə sıralayırıq və IS_ID-ni silirik
+        wide_out = wide.reset_index(level='IS_ID', drop=True).reset_index()
+
+        workbook = Workbook()
+        workbook.remove(workbook.active)
+        
+        write_xidmet_sheet_with_multiheader(workbook, "Yataq_Xidmetleri", wide_out, ordered_cols)
+        logger.info("Yataq xidmətləri hesabatı vərəqi yaradıldı.")
+        
+        workbook.save(output_path)
+        print(f"✅ Rapor saxlanıldı: {output_path}")
+
+    except oracledb.DatabaseError as e:
+        print(f"❌ Veritabanı xətası: {e}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"❌ Xəta: {e}\n{traceback.format_exc()}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    for m in ['oracledb','pandas','openpyxl']:
+        try:
+            __import__(m)
+        except ImportError:
+            print(f"❌ {m} modulu quraşdırılmayıb. Quraşdırın: pip install {m}")
+            sys.exit(1)
+    generate_report()
