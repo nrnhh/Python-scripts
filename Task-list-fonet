@@ -1,0 +1,357 @@
+
+import imaplib
+import email
+from email.header import decode_header
+from email.utils import parseaddr
+from collections import Counter, defaultdict
+from datetime import datetime
+import pandas as pd  # Excel üçün lazım
+import os  # Fayl saxlamaq üçün
+import re  # Fayl adları üçün təmizləmə
+import sys  # Encoding üçün
+import io  # Older Python üçün
+
+# UTF-8 encoding-i təmin et (Windows PowerShell üçün)
+if sys.platform.startswith('win'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8')
+    except AttributeError:
+        # Python < 3.7 üçün
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
+# BMP.az IMAP konfiqurasiyası (SSL üçün port 993)
+imap_server = "mail.bmp.az"
+imap_port = 993  # SSL üçün standart
+email_address = "nuran.hasanov@bmp.az"
+password = "N2024!H"  # Sənin şifrən
+
+def decode_mime_words(s):
+    """Header-ları düzgün decode et (header-dəki charset-i istifadə et)"""
+    if not s:
+        return ''
+    decoded = ''
+    for part, charset in decode_header(s):
+        if isinstance(part, bytes):
+            if charset:
+                try:
+                    decoded += part.decode(charset)
+                    continue
+                except (LookupError, UnicodeDecodeError):
+                    pass  # Charset bilinmir və ya xəta, davam et
+            # Fallback: UTF-8, sonra iso-8859-9 (Türk/Azeri), sonra Latin-1
+            try:
+                decoded += part.decode('utf-8')
+            except UnicodeDecodeError:
+                try:
+                    decoded += part.decode('iso-8859-9')
+                except UnicodeDecodeError:
+                    decoded += part.decode('latin-1', errors='replace')
+        else:
+            decoded += str(part)
+    return decoded
+
+def connect_to_email():
+    # SSL ilə qoşul (port 993)
+    mail = imaplib.IMAP4_SSL(imap_server, imap_port)
+    mail.login(email_address, password)
+    # INBOX qovluğunu seç (gələn məktublar)
+    try:
+        mail.select("INBOX")
+        print("'INBOX' qovluğu tapıldı.")
+    except Exception as select_error:
+        print(f"'INBOX' qovluğu tapılmadı: {select_error}. BMP.az dəstəyi ilə qovluq adını yoxla!")
+        raise select_error
+    return mail
+
+def read_and_stack_excel_data(file_path, email_date):
+    """Excel faylını oxu, başlıq yoxla (məsələn, 'Gündəlik' ehtiva edən başlıqlar üçün), sonra 'Tarix' sütunu əlavə et"""
+    if not file_path.lower().endswith('.xlsx'):
+        return None  # Yalnız Excel üçün
+    
+    try:
+        df = pd.read_excel(file_path, sheet_name=0, header=0)  # 1-ci sheet-i oxu, header=0 ilə
+        if df.empty:
+            return None
+        
+        # Başlıq yoxla: 1-ci sətir (header) 'Gündəlik' və ya oxşar söz ehtiva edirsə (sənin istədiyin kimi)
+        header_row = df.iloc[0].astype(str).str.lower()  # 1-ci sətri string-ə çevir və kiçik hərflər
+        if not header_row.str.contains('gündəlik', na=False).any():
+            print(f"  Başlıq uyğun deyil (Gündəlik yoxdur), skip edirik: {os.path.basename(file_path)}")
+            return None  # Yalnız uyğun başlıqlar üçün proses et
+        
+        # 'Tarix' sütunu əlavə et (email tarixi)
+        df['Tarix'] = email_date
+        # Tarix-i ən sağa köçür (son sütun)
+        cols = df.columns.tolist()
+        cols = cols[-1:] + cols[:-1]  # Son sütunu əvvələ köçür
+        df = df[cols]
+        print(f"  Excel məlumatları oxundu və stack edildi (başlıq uyğun): {len(df)} sətir (fayl: {os.path.basename(file_path)})")
+        return df
+    except Exception as e:
+        print(f"  Excel məlumatlarını oxumaqda xəta ({os.path.basename(file_path)}): {e}")
+        return None
+
+def save_attachment(part, sender_email, date_str, attachment_dir):
+    """Attachment-i saxla, adını göndərən email + tarix + orijinal adla"""
+    filename = part.get_filename()
+    if filename:
+        # Decode header üçün düzgün decode
+        decoded_filename = decode_mime_words(filename)
+        
+        # Fayl adını təmizlə (qadağan simvollar)
+        safe_filename = re.sub(r'[<>:"/\\|?*]', '_', decoded_filename)
+        
+        # Unikal ad: sender_email_tarix_safe_filename
+        base_name = f"{sender_email.replace('@', '_at_')}_{date_str.replace(':', '_').replace('-', '_')}_{safe_filename}"
+        full_path = os.path.join(attachment_dir, base_name)
+        
+        # Əgər fayl artıq mövcuddursa, nömrə əlavə et
+        counter = 1
+        while os.path.exists(full_path):
+            name, ext = os.path.splitext(base_name)
+            full_path = os.path.join(attachment_dir, f"{name}_{counter}{ext}")
+            counter += 1
+        
+        # Faylı yaz
+        with open(full_path, 'wb') as f:
+            f.write(part.get_payload(decode=True))
+        print(f"  Attachment saxlanıldı: {full_path}")
+        return full_path
+    return None
+
+def search_emails_with_subject_and_attachments(mail, subject="Gündəlik görülən işlər"):
+    # Son 2 il ərzindəki e-poçtları al (non-ASCII search problemini qarşısını almaq üçün, sonra filter et)
+    status, messages = mail.search(None, 'SINCE "01-Jan-2023"')
+    email_ids = messages[0].split()
+    
+    # Email ID-lərini int-ə çevir və tərs sırala (ən yenidən köhnəyə)
+    sorted_ids = sorted([int(id) for id in email_ids], reverse=True)
+    
+    print(f"Son 2 il ərzində ümumi e-poçt sayı: {len(sorted_ids)}. Filter edirik...")
+    print("Proses başladı... Hər 100 e-poçt üçün yeniləmə göstəriləcək.")
+    
+    # Filter et: subject uyğun olanlar
+    matching_details = []
+    sender_data = defaultdict(list)  # Hər göndərən üçün məlumat siyahısı (DataFrame-lər)
+    attachments_dir = os.path.join(os.path.expanduser("~"), "Desktop", "attachments")  # Desktop-da qovluq
+    os.makedirs(attachments_dir, exist_ok=True)
+    print(f"Attachments qovluğu yaradıldı: {attachments_dir}")
+    
+    processed_count = 0
+    for num in sorted_ids:  # Yenidən köhnəyə
+        processed_count += 1
+        if processed_count % 100 == 0:
+            print(f"Proses: {processed_count}/{len(sorted_ids)} e-poçt yoxlanıldı... (İş gedir!)")
+        
+        try:
+            status, msg_data = mail.fetch(str(num), "(RFC822)")
+            msg = email.message_from_bytes(msg_data[0][1])
+            
+            # Subject decode et və yoxla
+            subject_decoded = decode_mime_words(msg["Subject"])
+            if subject not in subject_decoded:
+                continue  # Uyğun deyil, skip et
+            
+            # Göndərən (düzgün decode)
+            from_header = decode_mime_words(msg["From"])
+            realname, sender_email = parseaddr(from_header)
+            full_from = f"{realname} <{sender_email}>" if realname and sender_email else sender_email
+            
+            # Tarix
+            date_header = msg["Date"]
+            try:
+                date_obj = email.utils.parsedate_tz(date_header)
+                if date_obj:
+                    date_str = datetime(*date_obj[:6]).strftime("%Y-%m-%d %H:%M")
+                    ay = date_str[:7]  # YYYY-MM
+                    gun = date_str[:10]  # YYYY-MM-DD
+                else:
+                    date_str = date_header
+                    ay = "Tarix yoxdur"
+                    gun = "Tarix yoxdur"
+            except:
+                date_str = "Tarix yoxdur"
+                ay = "Tarix yoxdur"
+                gun = "Tarix yoxdur"
+            
+            # Attachments topla və məlumatları stack et
+            attachments = []
+            total_tasks = 0
+            stacked_data = None
+            if msg.is_multipart():
+                for part in msg.walk():
+                    if part.get_content_maintype() == 'multipart':
+                        continue
+                    if part.get('Content-Disposition') is None:
+                        continue
+                    if part.get_content_maintype() == 'text':
+                        continue  # Text parts skip et
+                    
+                    # Attachment saxla
+                    saved_path = save_attachment(part, sender_email, date_str, attachments_dir)
+                    if saved_path:
+                        attachments.append(saved_path)
+                        # Excel məlumatlarını oxu və stack et (yalnız uyğun başlıqlar üçün)
+                        excel_data = read_and_stack_excel_data(saved_path, date_str)
+                        if excel_data is not None:
+                            if stacked_data is None:
+                                stacked_data = excel_data
+                            else:
+                                stacked_data = pd.concat([stacked_data, excel_data], ignore_index=True)
+                            # Tapşırıq sayı hesabla (sətirlər sayı)
+                            total_tasks += len(excel_data)
+            
+            if stacked_data is not None:
+                # Göndərən üçün məlumatları saxla
+                sender_data[full_from].append(stacked_data)
+            
+            matching_details.append({
+                'Tarix': date_str,
+                'Gün': gun,
+                'Ay': ay,
+                'Göndərən': full_from,
+                'Mövzu': subject_decoded,
+                'Attachment Sayı': len(attachments),
+                'Tapşırıq Sayı': total_tasks,
+                'Attachments': '; '.join(attachments)  # Yollar siyahısı
+            })
+            
+        except Exception as fetch_error:
+            print(f"Bu e-poçtu oxumaqda xəta (ID {num}): {fetch_error}")
+            continue
+    
+    print(f"Proses tamamlandı! {processed_count}/{len(sorted_ids)} e-poçt yoxlanıldı.")
+    
+    total_count = len(matching_details)
+    print(f'"{subject}" mövzulu gələn uyğun e-poçtların sayı: {total_count}')
+    
+    if total_count == 0:
+        print("Heç bir uyğun e-poçt tapılmadı.")
+        return 0, Counter(), Counter(), [], []
+    
+    # Göndərənləri topla
+    senders = [d['Göndərən'] for d in matching_details]
+    sender_counts = Counter(senders)
+    
+    # Aylara görə saylar
+    valid_details = [d for d in matching_details if d['Ay'] != "Tarix yoxdur"]
+    monthly_counts = Counter([d['Ay'] for d in valid_details])
+    
+    # Günlərə görə tapşırıq sayları (ümumi)
+    daily_task_summary = []
+    for d in valid_details:
+        daily_task_summary.append({
+            'Gün': d['Gün'],
+            'Göndərən': d['Göndərən'],
+            'Tapşırıq Sayı': d['Tapşırıq Sayı']
+        })
+    
+    # Aylara görə göndərən və tapşırıq sayları
+    monthly_sender_summary = []
+    df_temp = pd.DataFrame(valid_details)
+    for ay, group in df_temp.groupby('Ay'):
+        ay_sender_counts = Counter(group['Göndərən'])
+        ay_total_tasks = group['Tapşırıq Sayı'].sum()
+        for sender, count in ay_sender_counts.most_common():
+            sender_tasks = group[group['Göndərən'] == sender]['Tapşırıq Sayı'].sum()
+            monthly_sender_summary.append({
+                'Ay': ay,
+                'Göndərən': sender,
+                'E-poçt Sayı': count,
+                'Tapşırıq Sayı': sender_tasks
+            })
+        # Ümumi ay tapşırıqları
+        monthly_sender_summary.append({
+            'Ay': ay,
+            'Göndərən': 'ÜMUMİ',
+            'E-poçt Sayı': len(group),
+            'Tapşırıq Sayı': ay_total_tasks
+        })
+    
+    # Nəticələri çap et
+    print("\nGələn e-poçtların göndərənlərə görə ümumi sayı:")
+    for sender, count in sender_counts.most_common():
+        print(f"{sender}: {count} ədəd")
+    
+    print("\nAylara görə ümumi e-poçt saylar:")
+    for ay, count in monthly_counts.most_common():
+        print(f"{ay}: {count} ədəd")
+    
+    print("\nGünlərə görə ümumi tapşırıq sayları:")
+    daily_df = pd.DataFrame(daily_task_summary)
+    daily_df = daily_df.groupby('Gün')['Tapşırıq Sayı'].sum().reset_index()
+    daily_df = daily_df.sort_values('Gün', ascending=False)
+    for _, row in daily_df.iterrows():
+        print(f"{row['Gün']}: {row['Tapşırıq Sayı']} tapşırıq")
+    
+    print("\nHər ay üçün göndərənlərə görə e-poçt və tapşırıq sayları:")
+    monthly_df = pd.DataFrame(monthly_sender_summary)
+    monthly_df = monthly_df.sort_values(by=['Ay', 'Tapşırıq Sayı'], ascending=[False, False])
+    for ay in sorted(monthly_df['Ay'].unique(), reverse=True):
+        ay_group = monthly_df[monthly_df['Ay'] == ay]
+        print(f"\n--- {ay} ayı (ümumi e-poçt: {monthly_counts[ay]}, ümumi tapşırıq: {ay_group[ay_group['Göndərən']=='ÜMUMİ']['Tapşırıq Sayı'].iloc[0]} ) ---")
+        for _, row in ay_group.iterrows():
+            if row['Göndərən'] != 'ÜMUMİ':
+                print(f" {row['Göndərən']}: {row['E-poçt Sayı']} e-poçt, {row['Tapşırıq Sayı']} tapşırıq")
+    
+    print("\nÜmumi siyahı:")
+    df_temp = pd.DataFrame(matching_details)
+    df_temp = df_temp.sort_values(by=['Ay', 'Tarix'], ascending=False)
+    for ay, group in df_temp.groupby('Ay'):
+        if ay != "Tarix yoxdur":
+            print(f"\n--- {ay} ayı ({len(group)} ədəd) ---")
+            for _, detail in group.iterrows():
+                print(f"Tarix: {detail['Tarix']} | Göndərən: {detail['Göndərən']} | Mövzu: {detail['Mövzu']} | Attachments: {detail['Attachment Sayı']} | Tapşırıq: {detail['Tapşırıq Sayı']}")
+    
+    # Ümumi Excel saxla (Desktop-da, hər göndərən üçün ayrı sheet, məlumatlar stack olunmuş)
+    print("Excel yaradılır... (Bu bir az vaxt ala bilər.)")
+    excel_dir = os.path.join(os.path.expanduser("~"), "Desktop")
+    excel_file = os.path.join(excel_dir, 'Umumi_Gorulen_Isler_Hesabat.xlsx')
+    if matching_details:
+        with pd.ExcelWriter(excel_file, engine='openpyxl') as writer:
+            # Hər göndərən üçün ayrı sheet: məlumatları birləşdir və yaz
+            for sender, data_list in sender_data.items():
+                if data_list:
+                    combined_df = pd.concat(data_list, ignore_index=True)
+                    # Sheet adını təmizlə (max 31 simvol)
+                    sheet_name = sender[:31].replace('/', '_').replace('\\', '_').replace('?', '').replace('*', '').replace('[', '').replace(']', '')
+                    combined_df.to_excel(writer, sheet_name=sheet_name, index=False)
+                    print(f"  {sender} üçün sheet yaradıldı: {len(combined_df)} sətir")
+            
+            # Summary sheet-lər
+            df_summary = pd.DataFrame(matching_details)
+            df_summary = df_summary.sort_values(by=['Ay', 'Tarix'], ascending=False)
+            df_summary.to_excel(writer, sheet_name='Gündəlik E-poçtlar Summary', index=False)
+            
+            # Aylara görə ümumi summary (e-poçt və tapşırıq)
+            summary_df = pd.DataFrame(monthly_counts.items(), columns=['Ay', 'E-poçt Sayı'])
+            summary_df['Ümumi Tapşırıq Sayı'] = [df_temp[df_temp['Ay']==ay]['Tapşırıq Sayı'].sum() for ay in summary_df['Ay']]
+            summary_df = summary_df.sort_values(by='Ümumi Tapşırıq Sayı', ascending=False)
+            summary_df.to_excel(writer, sheet_name='Aylara Görə Ümumi Summary', index=False)
+            
+            # Aylara görə göndərən summary
+            monthly_sender_df = pd.DataFrame(monthly_sender_summary)
+            monthly_sender_df = monthly_sender_df.sort_values(by=['Ay', 'Tapşırıq Sayı'], ascending=[False, False])
+            monthly_sender_df.to_excel(writer, sheet_name='Aylara Görə Göndərən və Tapşırıq Summary', index=False)
+            
+            # Günlərə görə summary
+            daily_summary_df = daily_df
+            daily_summary_df.to_excel(writer, sheet_name='Günlərə Görə Tapşırıq Summary', index=False)
+            
+        print(f"\nÜmumi Excel saxlanıldı (Görülən İşlər Hesabat, yalnız uyğun başlıqlar üçün): {excel_file}")
+    else:
+        print("\nSaxlanacaq məlumat yoxdur.")
+    
+    return total_count, sender_counts, monthly_counts, monthly_sender_summary, matching_details
+
+# Skripti işə sal
+try:
+    mail = connect_to_email()
+    total, sender_counts, monthly_counts, monthly_summary, details = search_emails_with_subject_and_attachments(mail)
+    mail.close()
+    mail.logout()
+except Exception as e:
+    print(f"Xəta: {e}")
+    print("IMAP ayarlarını və şifrəni yoxla! BMP.az dəstəyi ilə əlaqə saxla!")
