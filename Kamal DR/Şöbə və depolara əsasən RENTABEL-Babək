@@ -1,0 +1,407 @@
+# -*- coding: utf-8 -*-
+import oracledb
+import pandas as pd
+import os
+import logging
+from openpyxl import Workbook
+from openpyxl.utils import get_column_letter
+from openpyxl.styles import Alignment, PatternFill, Border, Side, Font
+import sys
+import traceback
+import re
+from itertools import groupby
+
+# ------------------------- LOGGING -------------------------
+logging.basicConfig(
+    format='%(asctime)s | %(levelname)s | %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger("servis-balans-raporu")
+
+# ------------------------- KONFİQURASİYA -------------------------
+username = "NURAN"
+password = "Nuran..2024!!"
+##dsn = "172.18.48.118:1521/FONETAZ"
+dsn = "172.18.79.23:1521/FONETAZ"
+oracle_client_path = r"C:\instant\instantclient_23_9"
+
+# Çıxış faylı adı Servis hesabatına uyğunlaşdırıldı
+base_output_path = os.path.join(os.path.expanduser("~"), "Desktop", "servis_ayliq_balans_raporu.xlsx")
+
+# Tarix aralığını Pythonda idarə etmək əvəzinə, sabit saxlayırıq.
+# SQL-dəki START_DATE='01.09.2025' və END_DATE='03.12.2025' istifadə olunur.
+
+# Hesabatın Metrikləri (Sizin SQL-dən gələn sütunlar)
+SERVICE_METRICS = [
+    'XESTE', 'MIQDAR', 'XESTE MEBLEGI', 'TESKILAT MEBLEGI',
+    'VESAIT EVVELE QALIQ MEBLEGI', 'GIRIS MEBLEGI', 'CIXIS ALIS MEBLEGI ILE',
+    'CIXIS SATIS MEBLEGI ILE', 'TULLANTI MEBLEGI', 'DIGER CIXIS MEBLEGI',
+    'VESAIT QALIQ MEBLEGI', 'KASSA GIRIS XIDMET UZRE', 'KASSA GIRIS VESAIT UZRE',
+    'EDEN HEKIM QAZANC', 'GONDEREN HEKIM QAZANC'
+]
+
+# Metrik başlıqların Azərbaycanca/Sadələşdirilmiş Mətni
+METRIC_TEXT_BALANS = {
+    'XESTE': 'Xəstə sayı',
+    'MIQDAR': 'Xidmət miqdarı',
+    'XESTE MEBLEGI': 'Xəstə Məbləği',
+    'TESKILAT MEBLEGI': 'Təşkilat Məbləği',
+    'VESAIT EVVELE QALIQ MEBLEGI': 'Stok Başlanğıc Qalığı',
+    'GIRIS MEBLEGI': 'Stok Giriş (Məb)',
+    'CIXIS ALIS MEBLEGI ILE': 'Stok Çıxış (Alış Məb)',
+    'CIXIS SATIS MEBLEGI ILE': 'Stok Çıxış (Satış Məb)',
+    'TULLANTI MEBLEGI': 'Tullantı Çıxışı',
+    'DIGER CIXIS MEBLEGI': 'Digər Çıxışlar',
+    'VESAIT QALIQ MEBLEGI': 'Stok Sonu Qalığı',
+    'KASSA GIRIS XIDMET UZRE': 'Kassa Giriş (Xidmət)',
+    'KASSA GIRIS VESAIT UZRE': 'Kassa Giriş (Vəsait)',
+    'EDEN HEKIM QAZANC': 'Həkim Qazancı (Edən)',
+    'GONDEREN HEKIM QAZANC': 'Həkim Qazancı (Göndərən)'
+}
+
+# ------------------------- SQL QUERY (SİZİN BALANS SORĞUNUZ) -------------------------
+SQL_QUERY = r"""
+WITH START_DATE AS (
+    SELECT TO_DATE('01.09.2025', 'DD.MM.YYYY') AS TARIH FROM DUAL
+),
+END_DATE AS (
+    SELECT TO_DATE('03.12.2025', 'DD.MM.YYYY') AS TARIH FROM DUAL
+)
+SELECT
+    TO_CHAR(T1.AY_TARIH, 'YYYY-MM') AS "IL_AY",
+    HS.SR_ADI AS "SOBE",
+    NVL(T1.XESTE,0) AS "XESTE",
+    NVL(T1.MIQDAR,0) AS "MIQDAR",
+    NVL(T1.XESTEMEB,0) AS "XESTE MEBLEGI",
+    NVL(T1.TESKILATMEB,0) AS "TESKILAT MEBLEGI",
+    NVL(GD1.EVVELEGIRISMEB,0)-NVL(CD1.EVVELECIXISMEB,0) AS "VESAIT EVVELE QALIQ MEBLEGI",
+    NVL(Y1.GIRISMEB,0) AS "GIRIS MEBLEGI",
+    NVL(S1.CIXISALISMEB,0) AS "CIXIS ALIS MEBLEGI ILE",
+    NVL(S1.CIXISSATMEB,0) AS "CIXIS SATIS MEBLEGI ILE",
+    NVL(S1.TULLANTIMEB,0) AS "TULLANTI MEBLEGI",
+    NVL(S1.DIGCIXISMEB,0) AS "DIGER CIXIS MEBLEGI",
+    NVL(GD1.EVVELEGIRISMEB,0)-NVL(CD1.EVVELECIXISMEB,0)+NVL(Y1.GIRISMEB,0)-NVL(S1.CIXISALISMEB,0)-NVL(S1.TULLANTIMEB,0)-NVL(S1.DIGCIXISMEB,0) AS "VESAIT QALIQ MEBLEGI",
+    NVL(R1.XIDMETMEB,0) AS "KASSA GIRIS XIDMET UZRE",
+    NVL(R1.VESAITMEB,0) AS "KASSA GIRIS VESAIT UZRE",
+    NVL(P1.EDENQAZANC,0) AS "EDEN HEKIM QAZANC",
+    NVL(P1.GONDERENQAZANC,0) AS "GONDEREN HEKIM QAZANC"
+FROM FONETHBYSADM.H_SERVIS HS
+
+-- T1: Xəstə və Xidmət Məlumatları
+LEFT JOIN
+(
+    SELECT
+        T.SR_ID,
+        TRUNC(T.HI_TARIH, 'MM') AS AY_TARIH,
+        COUNT(DISTINCT T.HK_ID) AS XESTE,
+        SUM(T.HI_MIKTAR) AS MIQDAR,
+        SUM(T.HI_MIKTAR * T.HI_HFIYAT) AS XESTEMEB,
+        SUM(T.HI_KTUTAR) AS TESKILATMEB
+    FROM fonethbys.V_IST_GENEL_HIZMET T
+    WHERE T.HI_TARIH >= (SELECT TARIH FROM START_DATE)
+      AND T.HI_TARIH <= (SELECT TARIH FROM END_DATE)
+    GROUP BY T.SR_ID, TRUNC(T.HI_TARIH, 'MM')
+) T1 ON T1.SR_ID = HS.SR_ID
+
+-- Y1: Vəsait Girişi
+LEFT JOIN
+(
+    SELECT
+        Y.DEPOID,
+        TRUNC(Y.TARIH, 'MM') AS AY_TARIH,
+        SUM(Y.MIKTAR*Y.FIYATKDV) AS GIRISMEB
+    FROM fonethbys.V_STOK_LIST_GIRISFISDETAY Y
+    WHERE Y.TARIH >= (SELECT TARIH FROM START_DATE)
+      AND Y.TARIH <= (SELECT TARIH FROM END_DATE)
+      AND Y.FORMTYPE=3
+    GROUP BY Y.DEPOID, TRUNC(Y.TARIH, 'MM')
+) Y1 ON Y1.DEPOID = HS.SR_ID AND Y1.AY_TARIH = T1.AY_TARIH
+
+-- S1: Vəsait Çıxışı
+LEFT JOIN
+(
+    SELECT
+        S.DEPOID,
+        TRUNC(S.TARIH, 'MM') AS AY_TARIH,
+        SUM(CASE WHEN S.formtype =2 THEN S.MIKTAR*S.ALISFIYAT ELSE 0 END) AS CIXISALISMEB,
+        SUM(CASE WHEN S.formtype =2 THEN S.MIKTAR*S.FIYAT ELSE 0 END) AS CIXISSATMEB,
+        SUM(CASE WHEN S.formtype =3 AND S.hedefdepoid IN (202,374,449,445,220,415,414,336,413) THEN S.MIKTAR*S.ALISFIYAT ELSE 0 END ) AS TULLANTIMEB,
+        SUM(CASE WHEN S.formtype =3 AND S.hedefdepoid NOT IN (202,374,449,445,220,415,414,336,413) THEN S.MIKTAR*S.ALISFIYAT ELSE 0 END ) AS DIGCIXISMEB,
+        SUM(S.HBORCTUTAR) AS BORCDER
+    FROM fonethbys.V_STOK_LIST_CIKISFISDETAY S
+    WHERE S.TARIH >= (SELECT TARIH FROM START_DATE)
+      AND S.TARIH <= (SELECT TARIH FROM END_DATE)
+    GROUP BY S.DEPOID, TRUNC(S.TARIH, 'MM')
+) S1 ON S1.DEPOID = HS.SR_ID AND S1.AY_TARIH = T1.AY_TARIH
+
+-- R1: Kassa Girişi
+LEFT JOIN
+(
+    SELECT
+        R.YAPANSERVIS,
+        TRUNC(R.TARIH, 'MM') AS AY_TARIH,
+        SUM(CASE WHEN R.ADI = 'Tetkik' THEN R.TUTAR ELSE 0 END) AS XIDMETMEB,
+        SUM(CASE WHEN R.ADI = 'Sarf' THEN R.TUTAR ELSE 0 END) AS VESAITMEB
+    FROM fonethbys.V_VZN_VEZNE_GIRIS_DETAY R
+    WHERE R.TARIH >= (SELECT TARIH FROM START_DATE)
+      AND R.TARIH <= (SELECT TARIH FROM END_DATE)
+    GROUP BY R.YAPANSERVIS, TRUNC(R.TARIH, 'MM')
+) R1 ON R1.YAPANSERVIS = HS.SR_ADI AND R1.AY_TARIH = T1.AY_TARIH
+
+-- P1: Həkim Qazancı
+LEFT JOIN
+(
+    SELECT
+        P.SR_ID,
+        TRUNC(P.HI_TARIH, 'MM') AS AY_TARIH,
+        SUM(CASE WHEN P.HAKEDISTURU = 1 THEN P.HAKTUTAR ELSE 0 END) AS EDENQAZANC,
+        SUM(CASE WHEN P.HAKEDISTURU = 2 THEN P.HAKTUTAR ELSE 0 END) AS GONDERENQAZANC
+    FROM fonethbys.V_HAKEDIS_RAPOR P
+    WHERE P.HI_TARIH >= (SELECT TARIH FROM START_DATE)
+      AND P.HI_TARIH <= (SELECT TARIH FROM END_DATE)
+    GROUP BY P.SR_ID, TRUNC(P.HI_TARIH, 'MM')
+) P1 ON P1.SR_ID = HS.SR_ID AND P1.AY_TARIH = T1.AY_TARIH
+
+-- GD1: Evvelki ilin Giriş Qalığı (START_DATE-a qədər)
+LEFT JOIN
+(
+    SELECT GD.DEPOID,
+        NVL(SUM((GD.MIKTAR*GD.FIYATKDV)*((100-NVL(GD.ISKONTO_ORAN,0))/100)),0) AS EVVELEGIRISMEB
+    FROM fonethbys.STOK_GIRISDETAY GD
+    WHERE GD.FORMTYPE IN (3)
+      AND GD.STOKONAY=1
+      AND GD.TARIH >= TRUNC((SELECT TARIH FROM START_DATE), 'YYYY')
+      AND GD.TARIH < (SELECT TARIH FROM START_DATE)
+    GROUP BY GD.DEPOID
+) GD1 ON GD1.DEPOID = HS.SR_ID
+
+-- CD1: Evvelki ilin Çıxış Qalığı (START_DATE-a qədər)
+LEFT JOIN
+(
+    SELECT CD.DEPOID,
+        NVL(SUM(CD.MIKTAR*CD.ALISFIYAT),0) AS EVVELECIXISMEB
+    FROM fonethbys.STOK_CIKISDETAY CD
+    WHERE CD.FORMTYPE IN (2,3,10)
+      AND CD.TARIH >= TRUNC((SELECT TARIH FROM START_DATE), 'YYYY')
+      AND CD.TARIH < (SELECT TARIH FROM START_DATE)
+    GROUP BY CD.DEPOID
+) CD1 ON CD1.DEPOID=HS.SR_ID
+WHERE T1.AY_TARIH IS NOT NULL
+ORDER BY T1.AY_TARIH, HS.SR_ADI
+"""
+# ------------------------- YARDIMÇI FUNKSİYALAR -------------------------
+def initialize_oracle_client(client_path: str):
+    if not os.path.exists(client_path):
+        print(f"❌ Oracle Instant Client yolu tapılmadı: {client_path}")
+        sys.exit(1)
+    oracledb.init_oracle_client(lib_dir=client_path)
+    logger.info(f"Oracle Instant Client başladıldı: {client_path}")
+
+def get_unique_output_path(base_path: str) -> str:
+    if not os.path.exists(base_path):
+        return base_path
+    base, ext = os.path.splitext(base_path)
+    i = 1
+    while True:
+        cand = f"{base}_{i}{ext}"
+        if not os.path.exists(cand):
+            return cand
+        i += 1
+
+def sanitize_sheet_name(name: str) -> str:
+    name = re.sub(r'[\[\]\*?:/\\]', '_', name)
+    return (name or "Sheet")[:31]
+
+def get_scalar(val, default=None):
+    try:
+        if isinstance(val, pd.Series):
+            return val.iloc[0] if not val.empty else default
+        if hasattr(val, "item"):
+            try:
+                return val.item()
+            except Exception:
+                return val
+        return val if val is not None else default
+    except Exception:
+        return val if val is not None else default
+
+# ------------------------- EXCEL YAZIMI (SERVİS ÜÇÜN DƏYİŞDİRİLDİ) -------------------------
+def write_service_sheet_with_multiheader(workbook: Workbook, sheet_name: str,
+                                         wide_df: pd.DataFrame, ordered_metrics: list):
+    """
+    Servis Balans Hesabatı üçün Excel səhifəsini yaradır və pivot edilmiş datanı yazır.
+    Sütunlar: Metrika (Satırda) x Ay (Sütunda).
+    """
+    if sheet_name in workbook.sheetnames:
+        workbook.remove(workbook[sheet_name])
+    ws = workbook.create_sheet(title=sanitize_sheet_name(sheet_name))
+
+    center = Alignment(horizontal='center', vertical='center')
+    right = Alignment(horizontal='right', vertical='center')
+    bold = Font(bold=True)
+    title_font = Font(bold=True, size=14)
+    thin = Border(left=Side(style='thin'), right=Side(style='thin'),
+                  top=Side(style='thin'), bottom=Side(style='thin'))
+
+    # Başlıq
+    title = f"{sheet_name} – Aylıq Maliyyə və Stok Balans Hesabatı"
+    total_cols = 1 + len(wide_df.columns)
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=max(2, total_cols))
+    c = ws.cell(row=1, column=1, value=title); c.alignment = center; c.font = title_font
+    c.fill = PatternFill(start_color="DDEBF7", end_color="DDEBF7", fill_type="solid")
+
+    # Başlıqlar: Servis Adı və Aylar (Sütunlar)
+    base_headers = ['Metrika / Ay']
+    ws.cell(row=2, column=1, value=base_headers[0]).alignment = center; ws.cell(row=2, column=1).font = bold
+    ws.cell(row=2, column=1).fill = PatternFill(start_color="E6E6E6", end_color="E6E6E6", fill_type="solid")
+    ws.cell(row=2, column=1).border = thin
+
+    col = 2
+    months_found = wide_df.columns.tolist() # Ay sütunları
+    
+    # 2025-09, 2025-10, 2025-11, 2025-12 (Müvafiq olaraq)
+    MONTH_ORDER_SERVICE = ['2025-09', '2025-10', '2025-11', '2025-12'] # Cari hesabat üçün uyğun aylar
+
+    # Yalnız tapılan və sıralanmış ayları istifadə et
+    ordered_months = [m for m in MONTH_ORDER_SERVICE if m in months_found]
+    
+    for ay in ordered_months:
+        MONTH_NAME_DICT = {
+            '2025-09':'Sentyabr','2025-10':'Oktyabr','2025-11':'Noyabr','2025-12':'Dekabr'
+        }
+        MONTH_COLOR_DICT = {
+            '2025-09':"C2E0FF",'2025-10':"F5C2C2",'2025-11':"D8A8A8",'2025-12':"A8D8A8"
+        }
+        c = ws.cell(row=2, column=col, value=MONTH_NAME_DICT.get(ay, ay))
+        c.alignment = center; c.font = bold
+        c.fill = PatternFill(start_color=MONTH_COLOR_DICT.get(ay, "FFFFFF"), fill_type="solid")
+        c.border = thin
+        col += 1
+    
+    max_col_data = col # Data başlama sütunu
+
+    # Məlumat satırları
+    start_row = 3
+    ws.column_dimensions['A'].width = 35 # Metrika adı üçün
+    
+    # İndeks adlarını (Metrika) sırala
+    ordered_metrics_keys = [m for m in SERVICE_METRICS if m in wide_df.index.get_level_values(0)]
+    
+    # Məlumatın Yazılması
+    for ridx, metrik_key in enumerate(ordered_metrics_keys):
+        rr = start_row + ridx
+        metrik_display_name = METRIC_TEXT_BALANS.get(metrik_key, metrik_key)
+        
+        # Metrika adı (Satır 1)
+        ws.cell(row=rr, column=1, value=metrik_display_name).alignment = Alignment(horizontal='left', vertical='center')
+        ws.cell(row=rr, column=1).font = bold
+        ws.cell(row=rr, column=1).border = thin
+
+        # Aylıq Dəyərlər (Sütunlar)
+        ccol = 2
+        
+        # Datanı sadəcə metrika key ilə seçirik
+        try:
+             # Tək bir səviyyəli MultiIndex-dən Sətri almaq
+            row_data = wide_df.loc[metrik_key]
+        except KeyError:
+            # Metrika tapılmadıqda boş sətir yarat
+            row_data = pd.Series([0] * len(ordered_months), index=ordered_months)
+        
+        for ay in ordered_months:
+            val = row_data.get(ay, 0)
+            val = get_scalar(val, 0)
+            
+            c_data = ws.cell(row=rr, column=ccol, value=val)
+            c_data.alignment = right
+            c_data.border = thin
+            # Maliyyə məlumatları olduğu üçün rəqəmləri formatlaya bilərsiniz (məsələn: #,##0.00)
+            # c_data.number_format = '#,##0.00' 
+            ccol += 1
+
+    # Bütün xanaların kənarlıqlarını yenilə
+    max_row = start_row + len(ordered_metrics_keys) - 1
+    for rr in range(2, max_row + 1):
+        for cc in range(1, max_col_data):
+            ws.cell(row=rr, column=cc).border = thin
+
+    ws.freeze_panes = 'B3' # Metrika adı və Başlıqları dondur
+
+# ------------------------- HESABAT GENERATORU -------------------------
+def generate_report():
+    try:
+        initialize_oracle_client(oracle_client_path)
+
+        output_path = get_unique_output_path(base_output_path)
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+        logger.info("Veritabanına bağlanılır...")
+        with oracledb.connect(user=username, password=password, dsn=dsn) as conn:
+            logger.info("SQL işlədilir...")
+            # SQL-in bütün sütun adlarını böyük hərfə çeviririk (Oracle-dan gələn dataya uyğun)
+            df = pd.read_sql(SQL_QUERY, con=conn)
+
+        if df.empty:
+            logger.warning("Sorğu boş nəticə qaytardı.")
+            print("⚠️ Heç bir sətir tapılmadı.")
+            return
+
+        df.columns = [str(col).upper() for col in df.columns]
+
+        workbook = Workbook()
+        workbook.remove(workbook.active)
+        
+        # Servis Balans Hesabatı üçün pivot cədvəl:
+        # Index: Metrik adı (Xeste, Miqdar, Qalıq və s.)
+        # Columns: Ay (IL_AY)
+        # Values: Məbləğ/Say
+        
+        # İlk olaraq bütün metrik sütunlarını al
+        metric_value_columns = [col for col in SERVICE_METRICS if col in df.columns]
+
+        # Servislər üzrə dövr
+        for sobe, df_s in df.groupby('SOBE'):
+            # Data-Frame-i 'IL_AY' üzrə pivot etməzdən əvvəl
+            # 'SOBE' cədvəlinin hər bir metrikini bir sətirə yığırıq (un-pivot kimi)
+            # və ay (IL_AY) üzrə cəmləyirik.
+            
+            # Un-pivot əməliyyatı üçün Datayı yenidən formatlayırıq:
+            melted_df = df_s.melt(
+                id_vars=['IL_AY', 'SOBE'],
+                value_vars=metric_value_columns,
+                var_name='METRIK_ADI',
+                value_name='DEYER'
+            )
+            
+            # Pivot əməliyyatı: İndeks: Metrika adı, Sütun: Ay (IL_AY)
+            wide = pd.pivot_table(
+                melted_df,
+                index=['METRIK_ADI'],
+                columns=['IL_AY'],
+                values='DEYER',
+                aggfunc='sum', # Məlumatı Ay və Metrika üzrə cəmlə
+                fill_value=0
+            )
+
+            # Səhifəni yaz (Hər Servis üçün bir səhifə)
+            sheet_name = str(sobe)
+            write_service_sheet_with_multiheader(workbook, sheet_name, wide, SERVICE_METRICS)
+
+        workbook.save(output_path)
+        print(f"✅ Rapor saxlanıldı: {output_path}")
+
+    except oracledb.DatabaseError as e:
+        print(f"❌ Veritabanı xətası: {e}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"❌ Xəta: {e}\n{traceback.format_exc()}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    for m in ['oracledb','pandas','openpyxl']:
+        try:
+            __import__(m)
+        except ImportError:
+            print(f"❌ {m} modulu quraşdırılmayıb. Quraşdırın: pip install {m}")
+            sys.exit(1)
+    generate_report()
