@@ -1,0 +1,207 @@
+import oracledb
+import smtplib
+import pandas as pd
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
+import datetime
+import logging
+import os
+import sys
+import warnings
+
+# Excel formatlamaq üçün
+from openpyxl import load_workbook
+from openpyxl.styles import Border, Side, Font, Alignment, PatternFill
+
+# Xəbərdarlıqları gizlət
+warnings.filterwarnings('ignore')
+
+# --- LOGGING ---
+logging.basicConfig(
+    filename='manual_run.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+# --- KONFIQURASIYA ---
+## oracledb.init_oracle_client(lib_dir=r"C:\instant\instantclient_23_9")
+oracledb.init_oracle_client(lib_dir="/opt/oracle/instantclient_23_6")
+
+DB_USER = "NURAN"
+DB_PASS = "Nuran..2024!!"
+DB_DSN = "172.18.79.23:1521/FONETAZ"
+
+SMTP_SERVER = "mail.bmp.az"
+SMTP_PORT = 587
+SENDER_EMAIL = "nuran.hasanov@bmp.az"
+SENDER_PASSWORD = "N2024!H"
+
+RECIPIENT_STRING = "nuranhasanov2003@gmail.com,fidan.garibova@azeraholding.az,kamil.shiraliyev@azeraholding.az" 
+RECIPIENT_LIST = [email.strip() for email in RECIPIENT_STRING.split(',') if email.strip()]
+
+def format_excel(filename):
+    """Excel faylını səliqəyə salan və formatlayan funksiya"""
+    wb = load_workbook(filename)
+    ws = wb.active
+
+    # Çərçivə stili (Nazik qara xətt)
+    thin_border = Border(left=Side(style='thin'), 
+                         right=Side(style='thin'), 
+                         top=Side(style='thin'), 
+                         bottom=Side(style='thin'))
+    
+    # 1. Başlıq və Hüceyrə Formatı
+    for row in ws.iter_rows():
+        for cell in row:
+            cell.border = thin_border
+            # Başlıq sətri (Row 1)
+            if cell.row == 1:
+                cell.font = Font(bold=True, color="FFFFFF") # Ağ yazı
+                cell.fill = PatternFill(start_color="4F81BD", end_color="4F81BD", fill_type="solid") # Göy fon
+                cell.alignment = Alignment(horizontal='center', vertical='center')
+            else:
+                cell.alignment = Alignment(horizontal='left', vertical='center')
+
+    # 2. Sütun Genişliyini Avtomatik Tənzimlə
+    for column in ws.columns:
+        max_length = 0
+        column_letter = column[0].column_letter
+        
+        for cell in column:
+            try:
+                if cell.value:
+                    cell_len = len(str(cell.value))
+                    if cell_len > max_length:
+                        max_length = cell_len
+            except:
+                pass
+        
+        adjusted_width = (max_length + 2)
+        if adjusted_width > 50: adjusted_width = 50 # Çox uzundursa kəs
+        ws.column_dimensions[column_letter].width = adjusted_width
+
+    wb.save(filename)
+    print("Excel formatlandı (Rənglər, Çərçivələr, Genişlik).")
+
+def run_manual_report():
+    print("\n--- MANUEL TEST REJİMİ (SON 7 GÜN) ---")
+    
+    # Test olduğu üçün Son 7 Günü götürürük
+    now = datetime.datetime.now()
+    start_date = (now - datetime.timedelta(days=7)).replace(hour=0, minute=0, second=0, microsecond=0)
+    end_date = now
+    
+    # SQL üçün format
+    str_start = start_date.strftime("%d.%m.%Y %H:%M:%S")
+    str_end = end_date.strftime("%d.%m.%Y %H:%M:%S")
+    
+    # --- YENİ HİSSƏ: ADLANDIRMA MƏNTİQİ ---
+    date_label = f"({start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')})"
+    
+    # Bu ad həm Mail Başlığı (Subject) olacaq, həm də Fayl adı
+    report_name = f"Babək filialı üzrə geri qaytarma hesabatı {date_label}"
+    
+    print(f"Hesabatın adı: {report_name}")
+    print(f"Sorğu Tarixi: {str_start} --- {str_end}")
+
+    # 1. ORACLE-DAN DATA ÇƏKMƏK
+    try:
+        conn = oracledb.connect(user=DB_USER, password=DB_PASS, dsn=DB_DSN)
+        print("Bazaya qoşuldu.")
+        
+        # YENİLİK: AND A.TUTAR <> 0 (Məbləğ 0 olmayanlar)
+        sql_query = """
+        SELECT 
+            z.hk_telefon as "Telefon nomresi",
+            z.hk_kodu as "Kart nomresi",
+            A.ODEME_TURU as "Odenis novu",
+            TO_CHAR(A.TARIH, 'DD.MM.YYYY') as "Tarix",
+            A.SAAT as "Saat",
+            A.ILGILI as "Pasient",
+            A.DETAYACIKLAMA as "Xidmet",
+            A.TUTAR as "Mebleg"
+        FROM fonethbys.V_VZN_VEZNE_CIKIS_DETAY A
+        LEFT JOIN fonethbys.v_vzn_vezne_cikis s ON s.ID = A.USTID
+        LEFT JOIN fonethbys.h_hastakayit z ON z.hk_id = s.HK_ID
+        WHERE A.ODEME_TURUID IN (32,42,104)
+          AND A.TUTAR <> 0  -- Məbləği 0 olanları gətirmə
+          AND TO_DATE(TO_CHAR(A.TARIH, 'DD.MM.YYYY') || ' ' || A.SAAT, 'DD.MM.YYYY HH24:MI:SS') 
+              BETWEEN TO_DATE(:start_date, 'DD.MM.YYYY HH24:MI:SS') 
+              AND TO_DATE(:end_date, 'DD.MM.YYYY HH24:MI:SS')
+        ORDER BY A.TARIH ASC, A.SAAT ASC
+        """
+        
+        params = {"start_date": str_start, "end_date": str_end}
+        df = pd.read_sql(sql_query, conn, params=params)
+        conn.close()
+        
+        print(f"Tapılan sətir sayı: {len(df)}")
+        
+    except Exception as e:
+        print(f"!!! Baza xətası: {e}")
+        return 
+
+    # 2. EXCEL YARATMAQ (Adı report_name ilə eyni edirik)
+    excel_filename = f"{report_name}.xlsx"
+
+    if df.empty:
+        print("Məlumat tapılmadı (və ya hamısı 0 məbləğdir).")
+        return 
+    else:
+        df.to_excel(excel_filename, index=False)
+        try:
+            format_excel(excel_filename)
+        except Exception as e:
+            print(f"Formatlama xətası: {e}")
+
+    # 3. EMAIL GÖNDƏRMƏK
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = SENDER_EMAIL
+        msg['To'] = ", ".join(RECIPIENT_LIST)
+        msg['Subject'] = report_name # Başlıq
+
+        body = f"""
+        Salam,
+        
+        {report_name} əlavə olunur.
+        
+        Hörmətlə,
+        """
+        msg.attach(MIMEText(body, 'plain'))
+
+        with open(excel_filename, "rb") as attachment:
+            part = MIMEBase("application", "octet-stream")
+            part.set_payload(attachment.read())
+        
+        encoders.encode_base64(part)
+        
+        # Düzgün attachment adı
+        part.add_header(
+            'Content-Disposition', 
+            'attachment', 
+            filename=excel_filename
+        )
+        msg.attach(part)
+
+        print("Email göndərilir...")
+        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
+        server.starttls()
+        server.login(SENDER_EMAIL, SENDER_PASSWORD)
+        server.sendmail(SENDER_EMAIL, RECIPIENT_LIST, msg.as_string())
+        server.quit()
+        
+        print(f"UĞURLA TAMAMLANDI: Email göndərildi!")
+        
+        # Test üçün faylı silmirik
+        # os.remove(excel_filename)
+
+    except Exception as e:
+        print(f"!!! Email xətası: {e}")
+
+# --- BİRBAŞA İŞƏ SALMA ---
+if __name__ == "__main__":
+    run_manual_report()
+    input("\nProqram bitdi. Çıxmaq üçün Enter basın...")
