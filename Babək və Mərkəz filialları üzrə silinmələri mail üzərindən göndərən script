@@ -1,0 +1,221 @@
+import oracledb
+import smtplib
+import pandas as pd
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
+import datetime
+import time
+import logging
+import os
+import sys
+import warnings
+
+# Excel üçün kitabxanalar
+from openpyxl import load_workbook
+from openpyxl.styles import Border, Side, Font, Alignment, PatternFill
+
+# Xəbərdarlıqları gizlət
+warnings.filterwarnings('ignore')
+
+# --- LOGGING ---
+logging.basicConfig(
+    filename='daily_schedule_branches.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+# --- KONFIQURASIYA (SERVER) ---
+# Linux server üçün yol:
+oracledb.init_oracle_client(lib_dir="/opt/oracle/instantclient_23_6")
+# Windows test üçün (Lazım olsa aktiv edin):
+# oracledb.init_oracle_client(lib_dir=r"C:\instant\instantclient_23_9")
+
+# --- BAZA MƏLUMATLARI ---
+DB_USER = "NURAN"
+DB_PASS = "Nuran..2024!!"
+
+# IP ÜNVANLARI (Sizin qeyd etdiyiniz kimi)
+DSN_BABEK = "172.18.79.23:1521/FONETAZ"
+DSN_MERKEZ = "10.20.0.10:1521/FONETAZ"
+
+# --- EMAIL TƏNZİMLƏMƏLƏRİ ---
+SMTP_SERVER = "mail.bmp.az"
+SMTP_PORT = 587
+SENDER_EMAIL = "nuran.hasanov@bmp.az"
+SENDER_PASSWORD = "N2024!H"
+
+# --- ALICILAR ---
+# Hər iki filial üçün eyni alıcılar (ehtiyac olsa ayıra bilərsiniz)
+RECIPIENTS_STR = "nuranhasanov2003@gmail.com,kamil.shiraliyev@azeraholding.az,akif.aliyev@azeraholding.az"
+RECIPIENTS_LIST = [email.strip() for email in RECIPIENTS_STR.split(',') if email.strip()]
+
+# Saat neçədə göndərilsin?
+SCHEDULE_HOUR = 12
+SCHEDULE_MINUTE = 0
+
+def format_excel_professional(filename):
+    """Excel faylını Rəhbərlik üçün tam professional formata salan funksiya"""
+    try:
+        wb = load_workbook(filename)
+        ws = wb.active
+
+        thin_border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
+        header_fill = PatternFill(start_color="8B0000", end_color="8B0000", fill_type="solid")
+        even_row_fill = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
+        header_font = Font(bold=True, color="FFFFFF", size=11, name='Calibri')
+        body_font = Font(color="000000", size=10, name='Calibri')
+
+        ws.auto_filter.ref = ws.dimensions
+
+        for row in ws.iter_rows():
+            for cell in row:
+                cell.border = thin_border
+                cell.font = body_font
+                if cell.row == 1:
+                    cell.font = header_font
+                    cell.fill = header_fill
+                    cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+                else:
+                    if cell.row % 2 == 0:
+                        cell.fill = even_row_fill
+                    if cell.column in [2, 6, 9]: 
+                        cell.alignment = Alignment(horizontal='left', vertical='center', wrap_text=True)
+                    else:
+                        cell.alignment = Alignment(horizontal='center', vertical='center')
+
+        column_widths = {'A': 15, 'B': 30, 'C': 20, 'D': 18, 'E': 15, 'F': 25, 'G': 20, 'H': 12, 'I': 40, 'J': 15}
+        for col_char, width in column_widths.items():
+            ws.column_dimensions[col_char].width = width
+
+        wb.save(filename)
+    except Exception as e:
+        print(f"Excel format xətası: {e}")
+
+def send_email_with_attachment(subject, body, filename, recipients):
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = SENDER_EMAIL
+        msg['To'] = ", ".join(recipients)
+        msg['Subject'] = subject
+        
+        msg.attach(MIMEText(body, 'plain'))
+        
+        with open(filename, "rb") as attachment:
+            part = MIMEBase("application", "octet-stream")
+            part.set_payload(attachment.read())
+        
+        encoders.encode_base64(part)
+        part.add_header('Content-Disposition', 'attachment', filename=filename)
+        msg.attach(part)
+
+        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
+        server.starttls()
+        server.login(SENDER_EMAIL, SENDER_PASSWORD)
+        server.sendmail(SENDER_EMAIL, recipients, msg.as_string())
+        server.quit()
+        
+        print(f"✅ Email uğurla göndərildi: {subject}")
+        logging.info(f"Email sent: {subject}")
+        
+    except Exception as e:
+        logging.error(f"Email Error ({subject}): {e}")
+        print(f"!!! Email xətası ({subject}): {e}")
+
+# --- HESABAT GENERASİYA FUNKSİYASI (DİNAMİK IP İLƏ) ---
+def generate_report(branch_name, db_dsn, start_date_str, end_date_str, report_date_label, recipients):
+    print(f"\n--- {branch_name} Filialı üçün Emal Başladı ({db_dsn}) ---")
+    
+    report_title = f"{branch_name} filialı üzrə Silinmiş xidmətlər üzrə hesabat ({report_date_label})"
+    excel_filename = f"{branch_name}_Silinmis_{report_date_label}.xlsx"
+    
+    # SQL eynidir, çünki bazalar eyni strukturdadır
+    sql_query = """
+        SELECT 
+            t.hk_kodu as "Kart Nömrəsi",
+            t.hk_adi || ' ' || t.hk_soyadi || ' ' || t.hk_babaadi as "Xəstə Ad Soyad",
+            TO_CHAR(r.log_date, 'DD.MM.YYYY HH24:MI:SS') as "Silinmə Tarixi",
+            r.log_mac as "MAC Adress",
+            r.log_osuser as "Kompüter",
+            y.adsoyad as "Silən İstifadəçi",
+            TO_CHAR(r.hi_etar, 'DD.MM.YYYY HH24:MI:SS') as "Xidmət Tarixi",
+            r.hi_makrokod as "Xidmət Kodu",
+            z.is_adi as "Xidmət Adı",
+            r.hi_odturu as "Ödəniş Növü"
+        FROM fonethbys.h_hastakayit t 
+        LEFT JOIN fonethbys.log_h_hastakayit_alt_del r ON r.hi_kayitid=t.hk_id
+        LEFT JOIN fonethbysadm.ytk_kullanici y ON r.log_userid=y.id
+        LEFT JOIN fonethbys.h_islem z ON z.is_id=r.hi_islemid
+        WHERE r.log_date >= TO_DATE(:start_date, 'DD.MM.YYYY HH24:MI:SS') 
+          AND r.log_date < TO_DATE(:end_date, 'DD.MM.YYYY HH24:MI:SS')
+        ORDER BY r.log_date ASC
+    """
+
+    try:
+        # Burada artıq funksiyaya ötürülən xüsusi DSN istifadə olunur
+        conn = oracledb.connect(user=DB_USER, password=DB_PASS, dsn=db_dsn)
+        params = {"start_date": start_date_str, "end_date": end_date_str}
+        df = pd.read_sql(sql_query, conn, params=params)
+        conn.close()
+    except Exception as e:
+        print(f"!!! Baza xətası ({branch_name} - {db_dsn}): {e}")
+        logging.error(f"DB Error {branch_name}: {e}")
+        return
+
+    if df.empty:
+        print(f"Məlumat tapılmadı ({branch_name}).")
+        logging.info(f"No data for {branch_name}")
+        return
+
+    # Excel Yarat
+    df.to_excel(excel_filename, index=False)
+    format_excel_professional(excel_filename)
+
+    # Email Göndər
+    body = f"""
+Hörmətli Rəhbərlik,
+
+{branch_name} filialı üzrə Silinmiş xidmətlər üzrə hesabatı ({report_date_label}) nəzərinizə təqdim edirəm.
+
+Hörmətlə,
+    """
+    send_email_with_attachment(report_title, body, excel_filename, recipients)
+
+
+def run_all_jobs():
+    print(f"\n[{datetime.datetime.now()}] Gündəlik Proses Başlayır...")
+    
+    # --- TARİX HESABLAMA ---
+    today_midnight = datetime.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    yesterday_midnight = today_midnight - datetime.timedelta(days=1)
+    
+    str_start = yesterday_midnight.strftime("%d.%m.%Y %H:%M:%S")
+    str_end = today_midnight.strftime("%d.%m.%Y %H:%M:%S")
+    report_date_label = yesterday_midnight.strftime("%d.%m.%Y")
+    
+    print(f"Tarix: {report_date_label}")
+
+    # 1. BABƏK HESABATI (IP: 172.18.79.23)
+    generate_report("Babək", DSN_BABEK, str_start, str_end, report_date_label, RECIPIENTS_LIST)
+    
+    # 2. MƏRKƏZ HESABATI (IP: 10.20.0.10)
+    generate_report("Mərkəz", DSN_MERKEZ, str_start, str_end, report_date_label, RECIPIENTS_LIST)
+
+def start_scheduler():
+    print(f"--- SISTEM AKTIVDIR (MULTI-BRANCH) ---")
+    print(f"Babək IP: {DSN_BABEK}")
+    print(f"Mərkəz IP: {DSN_MERKEZ}")
+    print(f"Hər gün saat {SCHEDULE_HOUR:02d}:{SCHEDULE_MINUTE:02d}-da hesabatlar göndəriləcək.")
+    
+    while True:
+        now = datetime.datetime.now()
+        if now.hour == SCHEDULE_HOUR and now.minute == SCHEDULE_MINUTE:
+            run_all_jobs()
+            print(f"Növbəti yoxlama sabah saat {SCHEDULE_HOUR:02d}:{SCHEDULE_MINUTE:02d}-da...")
+            time.sleep(65) 
+        else:
+            time.sleep(30)
+
+if __name__ == "__main__":
+    start_scheduler()
