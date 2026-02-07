@@ -1,0 +1,209 @@
+# -*- coding: utf-8 -*-
+import oracledb
+import pandas as pd
+import os
+import time
+from datetime import datetime
+
+# --- AYARLAR ---
+username = "NURAN"
+password = "Nuran..2024!!"
+dsn      = "172.18.79.23:1521/FONETAZ"
+oracle_client_path = r"C:\instantclient-basic-windows.x64-21.20.0.0.0dbru\instantclient_21_20"
+
+# Çıxış faylı
+base_output_path = os.path.join(os.path.expanduser("~"), "Desktop", "Kassa_hesabatı.xlsx")
+
+# --- SQL SORĞUSU (Eynidir) ---
+SQL_QUERY = """
+SELECT * FROM (
+    SELECT 
+        'H' AS SEC, T.ID, -1 AS DETAYID, T.TARIH, '' AS DOKTORADSOYAD, 
+        TO_CHAR(T.ETAR, 'HH24:MI') AS SAAT, C.SR_ADI || ' Kassasından Devir' AS ILGILI, 
+        'Devir' AS TURU, '' AS ACIKLAMA, 'Devir Fişi' AS FISTURU, 
+        T.ALAN_KASAID AS KASAID, B.SR_ADI AS KASAADI, 'Nağd' AS ODEME_TURU, 
+        -1 AS GIRIS_TURUID, 1 AS GIRIS_SEKLIID, '' AS MAKBUZ_NO, '' AS ADI, 
+        T.TUTAR, '' AS DETAY_ILGI, '' AS ONAYDURUM, '' AS IADEDURUM, 
+        '' AS DETAYACIKLAMA, NULL AS HK_ID, '' AS YAPANHEKIM, '' AS YAPANSERVIS, 
+        NULL AS ETAR, K.ADSOYAD AS EKUL, '' AS ISTEYENHEKIM,
+        '' AS IADEONAYLAYAN, NULL AS IADEONAYKUL, 'H' AS IADEONAYDURUM, NULL AS IADEONAYTAR,
+        0 AS ISLEM_FIYAT, 0 AS INDIRIM_TUTARI, NULL AS BANKA_ADI
+    FROM FONETHBYSADM.VZN_DEVIRLER T
+    LEFT JOIN FONETHBYSADM.YTK_KULLANICI K ON K.ID = T.EKUL
+    LEFT JOIN FONETHBYSADM.H_SERVIS B ON B.SR_ID = T.ALAN_KASAID
+    LEFT JOIN FONETHBYSADM.H_SERVIS C ON C.SR_ID = T.DEVREDEN_KASAID
+    WHERE 1=0 
+
+    UNION ALL
+
+    SELECT 
+        'H' AS SEC, A.ID, DETAYID, A.TARIH, A.DOKTORADSOYAD, A.SAAT, 
+        A.ILGILI, A.TURU, A.ACIKLAMA, A.FISTURU, A.KASAID, A.KASAADI, 
+        A.ODEME_TURU, A.GIRIS_TURUID, A.GIRIS_SEKLIID, A.MAKBUZ_NO, A.ADI, 
+        A.TUTAR, A.DETAY_ILGI, A.ONAYDURUM, A.IADEDURUM, A.DETAYACIKLAMA, 
+        A.HK_ID, A.YAPANHEKIM, A.YAPANSERVIS, A.ETAR, A.EKUL, A.ISTEYENHEKIM,
+        A.IADEONAYLAYAN, A.IADEONAYKUL, A.IADEONAYDURUM, A.IADEONAYTAR,
+        A.ISLEM_FIYAT,
+        A.ISLEM_FIYAT - (A.TUTAR 
+                         + NVL((SELECT SUM(BK.TUTAR) FROM FONETHBYSADM.VZN_BONUS_KULLANIM BK WHERE BK.VZN_ID=A.ID),0)
+                         + NVL((SELECT SUM(AV.TUTAR) FROM FONETHBYSADM.Vzn_Avansharcama AV WHERE AV.TAHSILAT_ID=A.ID),0)) AS INDIRIM_TUTARI,
+        A.BANKA_ADI
+    FROM FONETHBYS.V_VZN_VEZNE_GIRIS_DETAY A 
+    WHERE 
+      A.TARIH >= TO_DATE('01.01.2025', 'DD.MM.YYYY')
+      AND A.TARIH <= TO_DATE('31.12.2025', 'DD.MM.YYYY')
+      AND A.TURU <> 'Devir'
+      AND (
+          A.GIRIS_SEKLIID = 5 
+          OR 
+          (A.GIRIS_SEKLIID = 1 AND UPPER(TRIM(NVL(A.ACIKLAMA, ' '))) = 'V')
+      )
+) GENEL_TABLO
+ORDER BY GENEL_TABLO.TARIH ASC, GENEL_TABLO.SAAT ASC
+"""
+
+def initialize_oracle_client(client_path: str):
+    if not os.path.exists(client_path): return
+    try: oracledb.init_oracle_client(lib_dir=client_path)
+    except: pass
+
+def get_unique_output_path(base_path: str) -> str:
+    if not os.path.exists(base_path): return base_path
+    base, ext = os.path.splitext(base_path)
+    i = 1
+    while True:
+        cand = f"{base}_{i}{ext}"
+        if not os.path.exists(cand): return cand
+        i += 1
+
+def main():
+    try:
+        initialize_oracle_client(oracle_client_path)
+        print("⏳ Məlumatlar oxunur (260k+ sətir)...")
+        
+        with oracledb.connect(user=username, password=password, dsn=dsn) as conn:
+            df = pd.read_sql(SQL_QUERY, con=conn)
+        
+        if df.empty:
+            print("⚠️ Məlumat tapılmadı.")
+            return
+
+        print(f"✅ {len(df)} sətir tapıldı. Excel üçün hazırlanır...")
+
+        # 1. Sütunların Seçilməsi və Adlandırılması
+        df.columns = [c.upper() for c in df.columns]
+        
+        # Tarix formatı
+        if pd.api.types.is_datetime64_any_dtype(df['TARIH']):
+            df['TARIH'] = df['TARIH'].dt.strftime('%d.%m.%Y')
+
+        columns_map = {
+            'TARIH': 'Tarix',
+            'SAAT': 'Saat',
+            'KASAADI': 'Kassa',
+            'FISTURU': 'Fiş Türü',
+            'ADI': 'Növ',
+            'TUTAR': 'Məbləğ (AZN)',
+            'ODEME_TURU': 'Ödəniş Türü',  # <-- Rəngləmə buna görə olacaq (G sütunu)
+            'ACIKLAMA': 'Açıqlama',
+            'EKUL': ' Əlavə edən',
+            'ILGILI': 'Əlaqəli Bölmə',
+            'DETAY_ILGI': 'Detallı İlgi'
+        }
+        
+        # Mövcud sütunları seçirik
+        available_cols = [c for c in columns_map.keys() if c in df.columns]
+        final_df = df[available_cols].rename(columns=columns_map)
+
+        # 2. XlsxWriter ilə PEŞƏKAR DİZAYN
+        output_path = get_unique_output_path(base_output_path)
+        print(f"🎨 Excel dizayn edilir və yazılır (Sürətli Mod)...")
+
+        with pd.ExcelWriter(output_path, engine='xlsxwriter') as writer:
+            sheet_name = 'Kassa-hesabatı'
+            final_df.to_excel(writer, index=False, sheet_name=sheet_name)
+            
+            workbook  = writer.book
+            worksheet = writer.sheets[sheet_name]
+            max_row = len(final_df) + 1
+            
+            # --- FORMATLAR ---
+            
+            # 1. Başlıq Formatı (Tünd Göy + Ağ Yazı)
+            header_format = workbook.add_format({
+                'bold': True,
+                'text_wrap': True,
+                'valign': 'vcenter',
+                'align': 'center',
+                'fg_color': '#203764', # Tünd Göy
+                'font_color': '#FFFFFF', # Ağ
+                'border': 1
+            })
+            
+            # 2. Pul Formatı
+            money_format = workbook.add_format({'num_format': '#,##0.00', 'border': 1})
+            
+            # 3. Nağd Sətirlər (Açıq Yaşıl)
+            format_nagd = workbook.add_format({
+                'bg_color': '#E2EFDA',   # Açıq Yaşıl
+                'font_color': '#006100', # Tünd Yaşıl Yazı
+                'border': 1
+            })
+            
+            # 4. Kart Sətirlər (Açıq Mavi)
+            format_kart = workbook.add_format({
+                'bg_color': '#DDEBF7',   # Açıq Mavi
+                'font_color': '#1F4E78', # Tünd Göy Yazı
+                'border': 1
+            })
+
+            # --- DİZAYNIN TƏTBİQİ ---
+            
+            # Başlıqları yenidən yazırıq (Formatlı olsun deyə)
+            for col_num, value in enumerate(final_df.columns.values):
+                worksheet.write(0, col_num, value, header_format)
+                
+            # Sütun Genişlikləri
+            worksheet.set_column('A:A', 12)  # Tarix
+            worksheet.set_column('B:B', 8)   # Saat
+            worksheet.set_column('C:C', 20)  # Kassa
+            worksheet.set_column('D:D', 15)  # Fiş
+            worksheet.set_column('E:E', 35)  # Ad Soyad (Geniş)
+            worksheet.set_column('F:F', 15, money_format) # Məbləğ
+            worksheet.set_column('G:G', 15)  # Ödəniş Türü
+            worksheet.set_column('H:K', 25)  # Digərləri
+
+            # --- CONDITIONAL FORMATTING (ƏN VACİB HİSSƏ) ---
+            # Excel-ə deyirik: G sütununa bax, 'Nağd' yazılıbsa sətri Yaşıl elə.
+            # G sütunu Excel-də 7-ci sütundur (indeks 6). Amma hərflə işləmək daha dəqiqdir.
+            # Bizim cədvəldə 'Ödəniş Türü' F sütunundan sonradır -> G sütunu.
+            
+            # Nağd üçün qayda (Yaşıl)
+            worksheet.conditional_format(f'A2:K{max_row}', {
+                'type':     'formula',
+                'criteria': '=$G2="Nağd"',
+                'format':   format_nagd
+            })
+            
+            # Kart üçün qayda (Mavi) - Əgər "Nağd" deyilsə (yəni Kartdırsa)
+            worksheet.conditional_format(f'A2:K{max_row}', {
+                'type':     'formula',
+                'criteria': '=$G2<>"Nağd"',
+                'format':   format_kart
+            })
+            
+            # Filtirləri aktiv et
+            worksheet.autofilter(0, 0, max_row, len(final_df.columns) - 1)
+            
+            # Sətirləri dondur (Scroll edəndə başlıq qalsın)
+            worksheet.freeze_panes(1, 0)
+
+        print(f"🎉 MÖHTƏŞƏM! Fayl hazırdır: {output_path}")
+
+    except Exception as e:
+        print(f"❌ Xəta: {e}")
+        import traceback
+        print(traceback.format_exc())
+
+if __name__ == "__main__":
+    main()
