@@ -1,22 +1,26 @@
-# -*- coding: utf-8 -*-
 import oracledb
 import pandas as pd
 import os
-import time
 from datetime import datetime
 
 # --- AYARLAR ---
 username = "NURAN"
 password = "Nuran..2024!!"
-dsn      = "172.18.79.23:1521/FONETAZ"
-oracle_client_path = r"C:\instantclient-basic-windows.x64-21.20.0.0.0dbru\instantclient_21_20"
+dsn = "172.18.79.23:1521/FONETAZ"
+oracle_client_path = r"C:\instant\instantclient_23_9"
 
 # Çıxış faylı
 base_output_path = os.path.join(os.path.expanduser("~"), "Desktop", "Kassa_hesabatı.xlsx")
 
-# --- SQL SORĞUSU (Eynidir) ---
+# --- SQL SORĞUSU ---
 SQL_QUERY = """
-SELECT * FROM (
+SELECT GENEL_TABLO.*,
+       CASE 
+            WHEN GIRIS_SEKLIID = 1 AND UPPER(TRIM(NVL(ACIKLAMA, ' '))) = 'V' THEN 'YASIL'
+            WHEN GIRIS_SEKLIID = 5 THEN 'MAVI'
+            ELSE 'STANDART'
+       END AS RENK_KODU
+FROM (
     SELECT 
         'H' AS SEC, T.ID, -1 AS DETAYID, T.TARIH, '' AS DOKTORADSOYAD, 
         TO_CHAR(T.ETAR, 'HH24:MI') AS SAAT, C.SR_ADI || ' Kassasından Devir' AS ILGILI, 
@@ -79,7 +83,7 @@ def get_unique_output_path(base_path: str) -> str:
 def main():
     try:
         initialize_oracle_client(oracle_client_path)
-        print("⏳ Məlumatlar oxunur (260k+ sətir)...")
+        print("⏳ Məlumatlar Oracle-dan çəkilir...")
         
         with oracledb.connect(user=username, password=password, dsn=dsn) as conn:
             df = pd.read_sql(SQL_QUERY, con=conn)
@@ -88,36 +92,34 @@ def main():
             print("⚠️ Məlumat tapılmadı.")
             return
 
-        print(f"✅ {len(df)} sətir tapıldı. Excel üçün hazırlanır...")
+        print(f"✅ {len(df)} sətir oxundu. Excel-ə köçürülür...")
 
-        # 1. Sütunların Seçilməsi və Adlandırılması
         df.columns = [c.upper() for c in df.columns]
         
-        # Tarix formatı
-        if pd.api.types.is_datetime64_any_dtype(df['TARIH']):
-            df['TARIH'] = df['TARIH'].dt.strftime('%d.%m.%Y')
+        if 'TARIH' in df.columns:
+            df['TARIH'] = pd.to_datetime(df['TARIH']).dt.strftime('%d.%m.%Y')
 
+        # Sütun xəritəsi
         columns_map = {
             'TARIH': 'Tarix',
             'SAAT': 'Saat',
             'KASAADI': 'Kassa',
             'FISTURU': 'Fiş Türü',
             'ADI': 'Növ',
+            'ODEME_TURU': 'Ödəniş Türü',
             'TUTAR': 'Məbləğ (AZN)',
-            'ODEME_TURU': 'Ödəniş Türü',  # <-- Rəngləmə buna görə olacaq (G sütunu)
+            'ILGILI': 'Xəstə məlumatları',
+            'DETAY_ILGI':'Xidmət adı',
+            'YAPANSERVIS': 'Xidmət Şöbəsi', 
             'ACIKLAMA': 'Açıqlama',
-            'EKUL': ' Əlavə edən',
-            'ILGILI': 'Əlaqəli Bölmə',
-            'DETAY_ILGI': 'Detallı İlgi'
+            'EKUL': 'Əlavə edən',
+            'RENK_KODU': 'RENK_KODU'
         }
         
-        # Mövcud sütunları seçirik
         available_cols = [c for c in columns_map.keys() if c in df.columns]
         final_df = df[available_cols].rename(columns=columns_map)
 
-        # 2. XlsxWriter ilə PEŞƏKAR DİZAYN
         output_path = get_unique_output_path(base_output_path)
-        print(f"🎨 Excel dizayn edilir və yazılır (Sürətli Mod)...")
 
         with pd.ExcelWriter(output_path, engine='xlsxwriter') as writer:
             sheet_name = 'Kassa-hesabatı'
@@ -125,85 +127,66 @@ def main():
             
             workbook  = writer.book
             worksheet = writer.sheets[sheet_name]
-            max_row = len(final_df) + 1
+            max_row = len(final_df)
+            max_col = len(final_df.columns)
             
-            # --- FORMATLAR ---
-            
-            # 1. Başlıq Formatı (Tünd Göy + Ağ Yazı)
+            # --- PEŞƏKAR FORMATLAR ---
             header_format = workbook.add_format({
-                'bold': True,
-                'text_wrap': True,
-                'valign': 'vcenter',
-                'align': 'center',
-                'fg_color': '#203764', # Tünd Göy
-                'font_color': '#FFFFFF', # Ağ
-                'border': 1
+                'bold': True, 'text_wrap': True, 'valign': 'vcenter', 'align': 'center',
+                'fg_color': '#333F4F', 'font_color': '#FFFFFF', 'border': 1
             })
             
-            # 2. Pul Formatı
-            money_format = workbook.add_format({'num_format': '#,##0.00', 'border': 1})
-            
-            # 3. Nağd Sətirlər (Açıq Yaşıl)
-            format_nagd = workbook.add_format({
-                'bg_color': '#E2EFDA',   # Açıq Yaşıl
-                'font_color': '#006100', # Tünd Yaşıl Yazı
-                'border': 1
+            # Pastel Yaşıl (V üçün)
+            format_yasil = workbook.add_format({
+                'bg_color': '#EBF1DE', 'font_color': '#3C5A14', 'border': 1, 'border_color': '#C1D59A'
             })
             
-            # 4. Kart Sətirlər (Açıq Mavi)
-            format_kart = workbook.add_format({
-                'bg_color': '#DDEBF7',   # Açıq Mavi
-                'font_color': '#1F4E78', # Tünd Göy Yazı
-                'border': 1
+            # Pastel Mavi (Giris 5 üçün)
+            format_mavi = workbook.add_format({
+                'bg_color': '#E5F1FB', 'font_color': '#1F4E78', 'border': 1, 'border_color': '#A6C9EC'
             })
+            
+            money_format = workbook.add_format({'num_format': '#,##0.00', 'border': 1, 'align': 'right'})
+            standard_format = workbook.add_format({'border': 1})
 
-            # --- DİZAYNIN TƏTBİQİ ---
-            
-            # Başlıqları yenidən yazırıq (Formatlı olsun deyə)
+            # Başlıqları yaz
             for col_num, value in enumerate(final_df.columns.values):
                 worksheet.write(0, col_num, value, header_format)
                 
-            # Sütun Genişlikləri
-            worksheet.set_column('A:A', 12)  # Tarix
-            worksheet.set_column('B:B', 8)   # Saat
-            worksheet.set_column('C:C', 20)  # Kassa
-            worksheet.set_column('D:D', 15)  # Fiş
-            worksheet.set_column('E:E', 35)  # Ad Soyad (Geniş)
-            worksheet.set_column('F:F', 15, money_format) # Məbləğ
-            worksheet.set_column('G:G', 15)  # Ödəniş Türü
-            worksheet.set_column('H:K', 25)  # Digərləri
+            # Sütun genişlikləri və əsas format
+            worksheet.set_column(0, 0, 12, standard_format) # Tarix
+            worksheet.set_column(1, 1, 8, standard_format)  # Saat
+            worksheet.set_column(6, 6, 15, money_format)    # Məbləğ (Sütun G)
+            worksheet.set_column(2, 5, 18, standard_format) 
+            worksheet.set_column(7, max_col-1, 25, standard_format)
 
-            # --- CONDITIONAL FORMATTING (ƏN VACİB HİSSƏ) ---
-            # Excel-ə deyirik: G sütununa bax, 'Nağd' yazılıbsa sətri Yaşıl elə.
-            # G sütunu Excel-də 7-ci sütundur (indeks 6). Amma hərflə işləmək daha dəqiqdir.
-            # Bizim cədvəldə 'Ödəniş Türü' F sütunundan sonradır -> G sütunu.
-            
-            # Nağd üçün qayda (Yaşıl)
-            worksheet.conditional_format(f'A2:K{max_row}', {
-                'type':     'formula',
-                'criteria': '=$G2="Nağd"',
-                'format':   format_nagd
+            # Rəngləmə üçün sütun hərfini tap (RENK_KODU sonuncudur)
+            # max_col-1 indeksidir, onu hərflə ifadə edək
+            col_letter = chr(ord('A') + max_col - 1) 
+
+            # Şərti formatların tətbiqi
+            worksheet.conditional_format(1, 0, max_row, max_col-1, {
+                'type': 'formula',
+                'criteria': f'=${col_letter}2="YASIL"',
+                'format': format_yasil
             })
             
-            # Kart üçün qayda (Mavi) - Əgər "Nağd" deyilsə (yəni Kartdırsa)
-            worksheet.conditional_format(f'A2:K{max_row}', {
-                'type':     'formula',
-                'criteria': '=$G2<>"Nağd"',
-                'format':   format_kart
+            worksheet.conditional_format(1, 0, max_row, max_col-1, {
+                'type': 'formula',
+                'criteria': f'=${col_letter}2="MAVI"',
+                'format': format_mavi
             })
             
-            # Filtirləri aktiv et
-            worksheet.autofilter(0, 0, max_row, len(final_df.columns) - 1)
-            
-            # Sətirləri dondur (Scroll edəndə başlıq qalsın)
+            # RENK_KODU sütununu gizlət
+            worksheet.set_column(max_col-1, max_col-1, None, None, {'hidden': True})
+
+            worksheet.autofilter(0, 0, max_row, max_col - 2) # RENK_KODU filtrə düşməsin
             worksheet.freeze_panes(1, 0)
 
-        print(f"🎉 MÖHTƏŞƏM! Fayl hazırdır: {output_path}")
+        print(f"🎉 Hesabat hazırlandı! Fayl: {output_path}")
 
     except Exception as e:
-        print(f"❌ Xəta: {e}")
-        import traceback
-        print(traceback.format_exc())
+        print(f"❌ Xəta baş verdi: {e}")
 
 if __name__ == "__main__":
     main()
