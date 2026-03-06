@@ -1,0 +1,174 @@
+# -*- coding: utf-8 -*-
+import os, warnings
+import pandas as pd
+import oracledb
+
+# ================== CONFIG ==================
+DB_USER = "NURAN"
+DB_PASS = "Nuran..2024!!"
+DB_DSN  = "172.18.79.23:1521/FONETAZ"
+INSTANT_CLIENT_DIR = r"C:\instantclient-basic-windows.x64-21.20.0.0.0dbru\instantclient_21_20"
+
+# SQL-də qısa aliaslardan istifadə edirik
+SQL_YEKUN = """
+WITH XIDMET_DATA AS (
+    SELECT
+        TO_CHAR(T.HI_TARIH, 'YYYY-MM') AS AY,
+        T.HI_ODTURU AS ODENIS_NOVU,
+        T.HKURUMADI AS TESKILAT_ADI,
+        COUNT(DISTINCT T.HK_ID) AS X_XESTE_SAYI,
+        SUM(NVL(T.HI_MIKTAR, 0)) AS XIDMET_SAYI,
+        SUM(NVL(T.HI_HTUTAR, 0)) AS X_ODE_MEB,
+        SUM(NVL(T.HI_HTUTAR, 0)) / 1.18 AS X_ODE_MEB_EDV,
+        SUM(NVL(T.HI_KTUTAR, 0)) AS X_TESK_MEB,
+        SUM(NVL(T.HI_KTUTAR, 0)) / 1.18 AS X_TESK_MEB_EDV
+    FROM fonethbys.V_IST_GENEL_HIZMET T 
+    WHERE T.HI_TARIH >= TO_DATE('2026-01-01', 'YYYY-MM-DD') 
+      AND T.HI_TARIH <= TO_DATE('2026-12-31', 'YYYY-MM-DD')
+    GROUP BY TO_CHAR(T.HI_TARIH, 'YYYY-MM'), T.HI_ODTURU, T.HKURUMADI
+),
+DERMAN_DATA AS (
+    SELECT
+        TO_CHAR(t.TARIH, 'YYYY-MM') AS AY,
+        t.ODEMETURU AS ODENIS_NOVU,
+        k.ADI AS TESKILAT_ADI,
+        COUNT(DISTINCT t.HASTA_HKID) AS D_XESTE_SAYI,
+        SUM(CASE WHEN TRIM(t.ODEMETURU) IN ('Ücretli', 'ücretli') THEN NVL(t.SNLTUTAR, 0) ELSE 0 END) AS D_ODE_MEB,
+        SUM(CASE WHEN TRIM(t.ODEMETURU) IN ('Ücretli', 'ücretli') THEN NVL(t.SNLALISTUTAR, 0) ELSE 0 END) AS D_ODE_ALIS_MEB,
+        SUM(CASE WHEN TRIM(t.ODEMETURU) IN ('Ücretli', 'ücretli') THEN NVL(t.SNLTUTAR, 0) ELSE 0 END) / 1.18 AS D_ODE_MEB_EDV,
+        SUM(CASE WHEN TRIM(t.ODEMETURU) IN ('Sigortalı', 'sigortalı') THEN NVL(t.SNLTUTAR, 0) ELSE 0 END) AS D_TESK_MEB,
+        SUM(CASE WHEN TRIM(t.ODEMETURU) IN ('Sigortalı', 'sigortalı') THEN NVL(t.SNLALISTUTAR, 0) ELSE 0 END) AS D_TESK_ALIS_MEB,
+        SUM(CASE WHEN TRIM(t.ODEMETURU) IN ('Sigortalı', 'sigortalı') THEN NVL(t.SNLTUTAR, 0) ELSE 0 END) / 1.18 AS D_TESK_MEB_EDV
+    FROM fonethbys.V_STOK_LIST_CIKISFISDETAY t
+    LEFT JOIN FONETHBYS.H_HASTAKAYIT z ON z.HK_ID = t.HASTA_HKID
+    LEFT JOIN fonethbysadm.H_KURUMK k ON k.ID = z.HK_KURUMID
+    WHERE t.FORMTYPE = 2
+      AND t.TARIH >= TO_DATE('2026-01-01', 'YYYY-MM-DD')
+      AND t.TARIH <= TO_DATE('2026-12-31', 'YYYY-MM-DD')
+    GROUP BY TO_CHAR(t.TARIH, 'YYYY-MM'), t.ODEMETURU, k.ADI
+),
+BIRLESMIS_DATA AS (
+    SELECT 
+        AY, ODENIS_NOVU, TESKILAT_ADI,
+        X_XESTE_SAYI, XIDMET_SAYI, X_ODE_MEB, X_ODE_MEB_EDV, X_TESK_MEB, X_TESK_MEB_EDV,
+        0 AS D_XESTE_SAYI, 0 AS D_ODE_MEB, 0 AS D_ODE_ALIS_MEB, 0 AS D_ODE_MEB_EDV, 0 AS D_TESK_MEB, 0 AS D_TESK_ALIS_MEB, 0 AS D_TESK_MEB_EDV
+    FROM XIDMET_DATA
+    UNION ALL
+    SELECT 
+        AY, ODENIS_NOVU, TESKILAT_ADI,
+        0, 0, 0, 0, 0, 0,
+        D_XESTE_SAYI, D_ODE_MEB, D_ODE_ALIS_MEB, D_ODE_MEB_EDV, D_TESK_MEB, D_TESK_ALIS_MEB, D_TESK_MEB_EDV
+    FROM DERMAN_DATA
+)
+SELECT 
+    AY AS AY,
+    ODENIS_NOVU AS ODENIS_NOVU,
+    TESKILAT_ADI AS TESKILAT_ADI,
+    SUM(X_XESTE_SAYI) AS X_XESTE_SAYI,
+    SUM(XIDMET_SAYI) AS XIDMET_SAYI,
+    ROUND(SUM(X_ODE_MEB), 2) AS X_ODE_MEB,
+    ROUND(SUM(X_ODE_MEB_EDV), 2) AS X_ODE_MEB_EDV,
+    ROUND(SUM(X_TESK_MEB), 2) AS X_TESK_MEB,
+    ROUND(SUM(X_TESK_MEB_EDV), 2) AS X_TESK_MEB_EDV,
+    SUM(D_XESTE_SAYI) AS D_XESTE_SAYI,
+    ROUND(SUM(D_ODE_MEB), 2) AS D_ODE_MEB,
+    ROUND(SUM(D_ODE_ALIS_MEB), 2) AS D_ODE_ALIS_MEB,
+    ROUND(SUM(D_ODE_MEB_EDV), 2) AS D_ODE_MEB_EDV,
+    ROUND(SUM(D_TESK_MEB), 2) AS D_TESK_MEB,
+    ROUND(SUM(D_TESK_ALIS_MEB), 2) AS D_TESK_ALIS_MEB,
+    ROUND(SUM(D_TESK_MEB_EDV), 2) AS D_TESK_MEB_EDV
+FROM BIRLESMIS_DATA
+WHERE TESKILAT_ADI IS NOT NULL
+GROUP BY AY, ODENIS_NOVU, TESKILAT_ADI
+ORDER BY AY, ODENIS_NOVU, TESKILAT_ADI
+"""
+
+# Pandas üçün uzun başlıqların xəritəsi
+COLUMN_MAPPING = {
+    "AY": "Ay",
+    "ODENIS_NOVU": "Ödəniş növü",
+    "TESKILAT_ADI": "Təşkilat adı",
+    "X_XESTE_SAYI": "Xidmət üzrə xəstə sayı",
+    "XIDMET_SAYI": "Göstərilən xidmət sayı",
+    "X_ODE_MEB": "Xidmət - Ödənişli məbləğ",
+    "X_ODE_MEB_EDV": "Xidmət - Ödənişli məbləğ (ƏDV çıxılmış)",
+    "X_TESK_MEB": "Xidmət - Təşkilat məbləği",
+    "X_TESK_MEB_EDV": "Xidmət - Təşkilat məbləği (ƏDV çıxılmış)",
+    "D_XESTE_SAYI": "Dərman üzrə xəstə sayı",
+    "D_ODE_MEB": "Dərman - Ödənişli məbləğ",
+    "D_ODE_ALIS_MEB": "Dərman - Ödənişli alış məbləği",
+    "D_ODE_MEB_EDV": "Dərman - Ödənişli məbləğ (ƏDV çıxılmış)",
+    "D_TESK_MEB": "Dərman - Təşkilat məbləği",
+    "D_TESK_ALIS_MEB": "Dərman - Təşkilat alış məbləği",
+    "D_TESK_MEB_EDV": "Dərman - Təşkilat məbləği (ƏDV çıxılmış)"
+}
+
+def get_unique_filename(base_name):
+    if not os.path.exists(base_name): return base_name
+    filename, ext = os.path.splitext(base_name)
+    counter = 1
+    new_name = f"{filename}_{counter}{ext}"
+    while os.path.exists(new_name):
+        counter += 1
+        new_name = f"{filename}_{counter}{ext}"
+    return new_name
+
+def main():
+    warnings.filterwarnings("ignore")
+    try: oracledb.init_oracle_client(lib_dir=INSTANT_CLIENT_DIR)
+    except: pass
+
+    file_name = get_unique_filename("2026_Yekun_Hesabat_Rəhbərlik_Üçün.xlsx")
+    conn = oracledb.connect(user=DB_USER, password=DB_PASS, dsn=DB_DSN)
+    
+    with pd.ExcelWriter(file_name, engine='xlsxwriter') as writer:
+        df = pd.read_sql(SQL_YEKUN, conn)
+        df = df.fillna(0)
+        
+        # Sütun adlarını dəyişirik
+        df.rename(columns=COLUMN_MAPPING, inplace=True)
+        
+        sheet_name = 'Yekun_Hesabat'
+        df.to_excel(writer, sheet_name=sheet_name, startrow=1, header=False, index=False)
+        
+        workbook = writer.book
+        worksheet = writer.sheets[sheet_name]
+        
+        money_fmt = workbook.add_format({'num_format': '#,##0.00', 'border': 1, 'align': 'right'})
+        num_fmt = workbook.add_format({'num_format': '#,##0', 'border': 1, 'align': 'center'})
+        text_fmt = workbook.add_format({'border': 1, 'align': 'left'})
+
+        (max_row, max_col) = df.shape
+        
+        column_settings = []
+        for i, col_name in enumerate(df.columns):
+            setting = {'header': col_name}
+            if i == 0:
+                setting['total_string'] = 'Cəmi'
+            elif i >= 3: 
+                setting['total_function'] = 'sum'
+                if "sayı" in col_name.lower():
+                    setting['format'] = num_fmt
+                else:
+                    setting['format'] = money_fmt
+            column_settings.append(setting)
+
+        worksheet.add_table(0, 0, max_row + 1, max_col - 1, {
+            'columns': column_settings,
+            'style': 'Table Style Medium 9',
+            'total_row': True,
+            'name': 'Yekun'
+        })
+
+        worksheet.set_column(0, 1, 15, text_fmt) 
+        worksheet.set_column(2, 2, 35, text_fmt) 
+        worksheet.set_column(3, 4, 22, num_fmt)  
+        worksheet.set_column(5, max_col - 1, 38, money_fmt) 
+
+        worksheet.freeze_panes(1, 0)
+
+    conn.close()
+    print(f"🚀 Tamamlandı! Rəhbərlik üçün fayl hazırlandı: {os.path.abspath(file_name)}")
+
+if __name__ == "__main__":
+    main()
