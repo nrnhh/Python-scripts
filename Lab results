@@ -1,0 +1,564 @@
+import oracledb
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Image, Spacer, KeepTogether
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+import os
+from datetime import datetime
+import telegram
+from telegram.error import TimedOut, TelegramError, RetryAfter
+import asyncio
+
+# Oracle Instant Client'ı başlat (Thick mod)
+try:
+    INSTANT_CLIENT_DIR = r"C:\instantclient-basic-windows.x64-21.20.0.0.0dbru\instantclient_21_20"
+    oracledb.init_oracle_client(lib_dir=INSTANT_CLIENT_DIR) 
+    print("Oracle Instant Client başlatıldı (Thick mod).")
+except oracledb.DatabaseError as e:
+    print(f"Instant Client başlatma hatası: {e}")
+    exit(1)
+
+# FİLİALLAR ÜÇÜN BAZA BAĞLANTILARI
+BRANCHES = [
+    {
+        "name": "Mərkəz",
+        "config": {
+            "user": "NURAN",
+            "password": "Nuran..2024!!",
+            "dsn": "10.20.0.10:1521/FONETAZ"
+        }
+    },
+    {
+        "name": "Medilux",
+        "config": {
+            "user": "NURAN",
+            "password": "Nuran..2024!!",
+            "dsn": "172.18.48.118:1521/FONETAZ"
+        }
+    }
+]
+
+# Telegram bot bilgileri
+BOT_TOKEN = "7771643402:AAEBD-m_g1I_qEKvgtyqxHwDTZVqlfawQQk"
+CHAT_ID = "-1002519044555"
+
+# PDF çıktı klasörü
+output_dir = "output_pdfs"
+if not os.path.exists(output_dir):
+    os.makedirs(output_dir)
+
+# Fontu kaydet (DejaVuSans, Azerbaycan hərfləri üçün)
+try:
+    font_path = "DejaVuSans.ttf"  # Font faylını skriptin olduğu qovluğa yerləşdirin
+    pdfmetrics.registerFont(TTFont("DejaVuSans", font_path))
+    print("DejaVuSans fontu qeydiyyatdan keçdi.")
+except Exception as e:
+    print(f"Font qeydiyyat xətası: {e}. Arial istifadə olunacaq.")
+    # Fallback olaraq Arial (Windows-da mövcuddur)
+    pdfmetrics.registerFont(TTFont("DejaVuSans", "arial.ttf"))
+
+def fetch_all_barkod_ids(db_config, branch_name):
+    """Bugün onaylanmış bütün BARKODID-ləri çəkir."""
+    try:
+        connection = oracledb.connect(**db_config)
+        cursor = connection.cursor()
+        
+        cursor.execute("""
+            SELECT DISTINCT BARKODID
+            FROM fonethbys.V_LIS_PRINT_RAPORSONUC
+            WHERE TUPID IN (13, 10, 16)
+            AND SONUC IS NOT NULL
+            AND TRUNC(ONAY_TAR) = TRUNC(SYSDATE)
+        """)
+        
+        barkod_ids = [row[0] for row in cursor.fetchall()]
+        cursor.close()
+        connection.close()
+        
+        print(f"[{branch_name}] Ümumi {len(barkod_ids)} BARKODID tapıldı. Bütün nəticələr işlənəcək.")
+        
+        return barkod_ids
+        
+    except oracledb.DatabaseError as e:
+        print(f"[{branch_name}] BARKODID-ləri çəkmə xətası: {e}")
+        return []
+
+def fetch_lab_results(barkod_id, db_config, branch_name):
+    """Veritabanından laboratuvar sonuçlarını ve hasta bilgilerini çeker."""
+    try:
+        # Veritabanına bağlan
+        print(f"[{branch_name}] Barkod ID {barkod_id} üçün verilənlər çəkilir...")
+        connection = oracledb.connect(**db_config)
+        cursor = connection.cursor()
+
+        # Hasta bilgilerini çek (ISLEMNO əlavə edildi)
+        print(f"[{branch_name}] Barkod ID {barkod_id} için hasta bilgileri çekiliyor...")
+        try:
+            cursor.execute("""
+                SELECT ADSOYAD, TCKIMLIKNO, NULL AS HK_TELEFON, YAS, CINSIYET, ISTEM_TARIH, ISLEMNO
+                FROM fonethbys.V_LIS_PRINT_RAPORBASLIK
+                WHERE BARKODID = :barkod_id
+            """, {"barkod_id": barkod_id})
+            hasta_bilgileri = cursor.fetchone()
+            if not hasta_bilgileri:
+                print(f"[{branch_name}] Hata: Barkod ID {barkod_id} için hasta bilgisi bulunamadı.")
+                hasta_adi, tckimlik, hasta_telefon, yas, cins, istem_tarih, islemno = "Bilinmiyor", "Bilinmiyor", "Bilinmiyor", "Bilinmiyor", "Bilinmiyor", None, "Bilinmiyor"
+            else:
+                hasta_adi, tckimlik, hasta_telefon, yas, cins, istem_tarih, islemno = hasta_bilgileri
+        except oracledb.DatabaseError as e:
+            print(f"[{branch_name}] Hasta bilgisi sorgusu başarısız: {e}. Fallback deneniyor...")
+            cursor.execute("""
+                SELECT ADSOYAD, TCKIMLIKNO, NULL AS HK_TELEFON, YAS, CINSIYET, ISTEM_TARIH, ISLEMNO
+                FROM fonethbys.V_LIS_PRINT_RAPORBASLIK
+                WHERE BARKODID = :barkod_id
+            """, {"barkod_id": barkod_id})
+            hasta_bilgileri = cursor.fetchone()
+            if not hasta_bilgileri:
+                hasta_adi, tckimlik, hasta_telefon, yas, cins, istem_tarih, islemno = "Bilinmiyor", "Bilinmiyor", "Bilinmiyor", "Bilinmiyor", "Bilinmiyor", None, "Bilinmiyor"
+            else:
+                hasta_adi, tckimlik, hasta_telefon, yas, cins, istem_tarih, islemno = hasta_bilgileri
+
+        print(f"[{branch_name}] Hasta bulundu: {hasta_adi}, TC: {tckimlik}, Kart No: {islemno}")
+
+        # Laboratuvar sonuçlarını çek ve tüp adına göre grupla
+        print(f"[{branch_name}] Barkod ID {barkod_id} üçün laboratuvar nəticələri çəkilir...")
+        cursor.execute("""
+            SELECT TUPLABADI, TETKIKADI, SONUC AS SONUC1, NDMIN || '-' || NDMAX AS REFERANSDEGER, UNITE, KOHNE_NETICE
+            FROM fonethbys.V_LIS_PRINT_RAPORSONUC
+            WHERE BARKODID = :barkod_id AND TUPID IN (13, 10, 16)
+            ORDER BY TUPLABADI, TETKIKADI
+        """, {"barkod_id": barkod_id})
+        lab_sonuclar = cursor.fetchall()
+        if not lab_sonuclar:
+            print(f"[{branch_name}] Uyarı: Barkod ID {barkod_id} üçün laboratuvar nəticəsi tapılmadı.")
+
+        # Tüp adına göre grupla
+        grouped_results = {}
+        for row in lab_sonuclar:
+            tup_adi = row[0] if row[0] else "Bilinmiyor"
+            if tup_adi not in grouped_results:
+                grouped_results[tup_adi] = []
+            grouped_results[tup_adi].append({
+                "test_adi": row[1],
+                "sonuc": row[2],
+                "referans": row[3],
+                "birim": row[4],
+                "kohne_netice": row[5] if row[5] else "N/A"
+            })
+
+        # Rapor başlığını çek
+        rapor_tarih = None
+        try:
+            cursor.execute("""
+                SELECT ADSOYAD, ISTEM_TARIH
+                FROM fonethbys.V_LIS_PRINT_RAPORBASLIK
+                WHERE BARKODID = :barkod_id
+            """, {"barkod_id": barkod_id})
+            rapor_baslik = cursor.fetchone()
+            if rapor_baslik:
+                rapor_tarih = rapor_baslik[1]
+        except oracledb.DatabaseError as e:
+            print(f"[{branch_name}] Rapor başlığı sorgusu başarısız (Barkod ID {barkod_id}): {e}.")
+
+        cursor.close()
+        connection.close()
+        print(f"[{branch_name}] Veritabanı bağlantısı bağlandı (Barkod ID {barkod_id}).")
+
+        return {
+            "hasta_adi": hasta_adi,
+            "hasta_telefon": hasta_telefon if hasta_telefon else "Bilinmiyor",
+            "tckimlik": tckimlik,
+            "yas": yas if yas else "Bilinmiyor",
+            "cins": cins if cins else "Bilinmiyor",
+            "islemno": islemno if islemno else "Bilinmiyor",
+            "istem_tarih": istem_tarih,
+            "rapor_tarih": rapor_tarih if rapor_tarih else datetime.now(),
+            "grouped_results": grouped_results
+        }
+
+    except oracledb.DatabaseError as e:
+        print(f"[{branch_name}] Veritabanı xətası (Barkod ID {barkod_id}): {e}")
+        return None
+    except ValueError as e:
+        print(f"[{branch_name}] Xəta (Barkod ID {barkod_id}): {e}")
+        return None
+
+def create_pdf(barkod_id, data):
+    """Laboratuvar sonuçlarını PDF formatına dönüştürür ve kaydeder."""
+    try:
+        pdf_file = os.path.join(output_dir, f"lab_results_{barkod_id}.pdf")
+        doc = SimpleDocTemplate(pdf_file, pagesize=letter, leftMargin=0.75*inch, rightMargin=0.75*inch, topMargin=0.75*inch, bottomMargin=0.75*inch)
+        elements = []
+
+        # Stil tanımları
+        styles = getSampleStyleSheet()
+        title_style = ParagraphStyle(
+            name='Title',
+            fontName='DejaVuSans',
+            fontSize=18,
+            leading=22,
+            alignment=1,  # Ortalanmış
+            spaceAfter=14,
+            textColor=colors.navy
+        )
+        normal_style = ParagraphStyle(
+            name='Normal',
+            fontName='DejaVuSans',
+            fontSize=12,
+            leading=14,
+            spaceAfter=10,
+            textColor=colors.black
+        )
+        patient_info_style = ParagraphStyle(
+            name='PatientInfo',
+            fontName='DejaVuSans',
+            fontSize=10,
+            leading=12,
+            textColor=colors.black
+        )
+        table_cell_style = ParagraphStyle(
+            name='TableCell',
+            fontName='DejaVuSans',
+            fontSize=8,  # Font ölçüsünü kiçiltdik
+            leading=10,  # Sətir aralığını kiçiltdik
+            wordWrap='CJK',
+            alignment=1  # Ortalanmış
+        )
+        table_group_header_style = ParagraphStyle(
+            name='TableGroupHeader',
+            fontName='DejaVuSans',
+            fontSize=12,
+            leading=14,
+            textColor=colors.black,
+            alignment=1  # Ortalanmış
+        )
+        header_sub_style = ParagraphStyle(
+            name='HeaderSub',
+            fontName='DejaVuSans',
+            fontSize=10,
+            leading=12,
+            textColor=colors.teal,
+            italic=True
+        )
+        address_style = ParagraphStyle(
+            name='Address',
+            fontName='DejaVuSans',
+            fontSize=10,
+            leading=12,
+            textColor=colors.teal,
+            alignment=1  # Ortalanmış (logo2 altında)
+        )
+        footer_text_style = ParagraphStyle(
+            name='FooterText',
+            fontName='DejaVuSans',
+            fontSize=10,
+            leading=12,
+            textColor=colors.black,
+            alignment=1  # Ortalanmış
+        )
+
+        # Header: Logo, başlıklar, sertifika ve adres
+        header_table_data = []
+        header_row = []
+
+        # Sol taraf: Logo ve alt yazı
+        logo1_path = "logo1.png"  # Sol logo (sunburst, "Baku Medical Plaza" içerir)
+        logo_text_data = []
+        if os.path.exists(logo1_path):
+            logo1 = Image(logo1_path, width=1.5*inch, height=1*inch)
+            logo_text_data.append([logo1])
+        else:
+            print(f"Xəta: Logo faylı ({logo1_path}) tapılmadı (Barkod ID {barkod_id}).")
+            logo_text_data.append([Paragraph("", normal_style)])
+        logo_text_data.append([Paragraph("SAĞLAMLIĞA DOĞAN GÜNƏŞ", header_sub_style)])
+        logo_text_table = Table(logo_text_data, colWidths=[3*inch])
+        logo_text_table.setStyle(TableStyle([
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('LEFTPADDING', (0, 0), (-1, -1), 5),
+        ]))
+        header_row.append(logo_text_table)
+
+        # Orta: Boş
+        header_row.append(Paragraph("", normal_style))
+
+        # Sağ taraf: Sertifika logosu, altında adres ve telefon
+        logo2_path = "logo2.png"  # Sertifika logosu
+        right_data = []
+        if os.path.exists(logo2_path):
+            logo2 = Image(logo2_path, width=1*inch, height=1*inch)
+            right_data.append([logo2])
+        else:
+            print(f"Xəta: Logo faylı ({logo2_path}) tapılmadı (Barkod ID {barkod_id}).")
+            right_data.append([Paragraph("", normal_style)])
+        right_data.append([Paragraph("Ünvan: (Bakı şəhəri) Babək pr. 92N", address_style)])
+        phone_row = []
+        phone_icon_path = "telephone_icon.png"
+        if os.path.exists(phone_icon_path):
+            phone_icon = Image(phone_icon_path, width=0.3*inch, height=0.3*inch)
+            phone_row.append(phone_icon)
+        else:
+            print(f"Xəta: Telefon ikonu faylı ({phone_icon_path}) tapılmadı (Barkod ID {barkod_id}).")
+        phone_row.append(Paragraph("909", address_style))
+        right_data.append(phone_row)
+        right_table = Table(right_data, colWidths=[2*inch])
+        right_table.setStyle(TableStyle([
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ]))
+        header_row.append(right_table)
+
+        header_table = Table([header_row], colWidths=[3*inch, 1.5*inch, 2*inch])
+        header_table.setStyle(TableStyle([
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('BOX', (0, 0), (-1, -1), 0.5, colors.black),
+            ('LEFTPADDING', (0, 0), (-1, -1), 10),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 10),
+            ('TOPPADDING', (0, 0), (-1, -1), 8),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+        ]))
+        elements.append(header_table)
+        elements.append(Spacer(1, 0.3*inch))
+
+        # Hasta bilgileri (çerçeve içinde, üç sıralı - Kart Nömrəsi ilə)
+        patient_info_data = [
+            [
+                Paragraph(f"Ad Soyad: {data['hasta_adi']}", patient_info_style),
+                Paragraph(f"Cins: {data['cins']}", patient_info_style),
+                Paragraph(f"Yaş: {data['yas']}", patient_info_style)
+            ],
+            [
+                Paragraph(f"İstək Tarixi: {data['istem_tarih'].strftime('%d.%m.%Y %H:%M:%S') if data['istem_tarih'] else 'Bilinmiyor'}", patient_info_style),
+                Paragraph(f"Rapor Tarixi: {data['rapor_tarih'].strftime('%d.%m.%Y %H:%M:%S')}", patient_info_style),
+                Paragraph(f"Pasport/S.V. Nömrəsi: {data['tckimlik']}", patient_info_style)
+            ],
+            [
+                Paragraph(f"Kart Nömrəsi: {data['islemno']}", patient_info_style),
+                Paragraph("", patient_info_style),
+                Paragraph("", patient_info_style)
+            ]
+        ]
+        patient_info_table = Table(patient_info_data, colWidths=[2.2*inch, 2.2*inch, 2.1*inch])
+        patient_info_table.setStyle(TableStyle([
+            ('BOX', (0, 0), (-1, -1), 1, colors.black),
+            ('INNERGRID', (0, 0), (-1, -1), 0.25, colors.black),
+            ('LEFTPADDING', (0, 0), (-1, -1), 10),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 10),
+            ('TOPPADDING', (0, 0), (-1, -1), 8),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+        ]))
+        elements.append(patient_info_table)
+        elements.append(Spacer(1, 0.4*inch))
+
+        # Tüp adına göre gruplu sonuç tabloları
+        for tup_adi, results in data['grouped_results'].items():
+            # Grup başlığı və cədvəli bir yerdə saxlamaq üçün elementləri toplayırıq
+            group_elements = []
+
+            # Grup başlığı
+            group_elements.append(Paragraph(tup_adi, table_group_header_style))
+            group_elements.append(Spacer(1, 0.1*inch))
+
+            # Tablo verileri
+            table_data = [[
+                Paragraph("Təhlil Adı", table_cell_style),
+                Paragraph("Nəticə", table_cell_style),
+                Paragraph("Vahid", table_cell_style),
+                Paragraph("Referans aralığı", table_cell_style),
+                Paragraph("Köhnə nəticə", table_cell_style)
+            ]]
+            for sonuc in results:
+                table_data.append([
+                    Paragraph(str(sonuc['test_adi'] or "N/A"), table_cell_style),
+                    Paragraph(str(sonuc['sonuc'] or "N/A"), table_cell_style),
+                    Paragraph(str(sonuc['birim'] or "N/A"), table_cell_style),
+                    Paragraph(str(sonuc['referans'] or "N/A"), table_cell_style),
+                    Paragraph(str(sonuc['kohne_netice']), table_cell_style)
+                ])
+
+            table = Table(table_data, colWidths=[2.5*inch, 0.8*inch, 0.8*inch, 1.2*inch, 1.2*inch], rowHeights=[0.3*inch] * len(table_data))  # Sətir hündürlüyünü kiçiltdik
+            table.setStyle(TableStyle([
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.black),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, -1), 'DejaVuSans'),
+                ('FONTSIZE', (0, 0), (-1, -1), 8),  # Font ölçüsünü kiçiltdik
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 4),  # Padding'i kiçiltdik
+                ('TOPPADDING', (0, 0), (-1, -1), 4),
+                ('LEFTPADDING', (0, 0), (-1, -1), 4),
+                ('RIGHTPADDING', (0, 0), (-1, -1), 4),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.white),
+                ('GRID', (0, 0), (-1, -1), 1, colors.black),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.lightgrey]),
+                ('BOX', (0, 0), (-1, -1), 1, colors.black),
+                ('INNERGRID', (0, 0), (-1, -1), 0.25, colors.black),
+            ]))
+            group_elements.append(table)
+
+            # Başlıq və cədvəli bir yerdə saxla
+            elements.append(KeepTogether(group_elements))
+            elements.append(Spacer(1, 0.2*inch))
+
+        # Footer: İmzalar, resimler, arka plan resmi ve renkli çubuklar
+        footer_table_data = []
+        footer_row = []
+
+        # Sol taraf: Jale Bağırlı ve bottom_image_1
+        left_footer_data = [
+            [Paragraph("Jale Bağırlı\nLaboratoriya Müdiri", footer_text_style)]
+        ]
+        if os.path.exists("bottom_image_1.png"):
+            bottom_image_1 = Image("bottom_image_1.png", width=1*inch, height=0.5*inch)
+            left_footer_data.append([bottom_image_1])
+        else:
+            print(f"Xəta: bottom_image_1.png faylı tapılmadı (Barkod ID {barkod_id}).")
+            left_footer_data.append([Paragraph("", normal_style)])
+        left_footer_table = Table(left_footer_data, colWidths=[3.25*inch])
+        left_footer_table.setStyle(TableStyle([
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ]))
+        
+        # Sağ taraf: Nigar Əhədova ve bottom_image_2
+        right_footer_data = [
+            [Paragraph("Nigar Əhədova\nHəkim-Laborant", footer_text_style)]
+        ]
+        if os.path.exists("bottom_image_2.png"):
+            bottom_image_2 = Image("bottom_image_2.png", width=1*inch, height=0.5*inch)
+            right_footer_data.append([bottom_image_2])
+        else:
+            print(f"Xəta: bottom_image_2.png faylı tapılmadı (Barkod ID {barkod_id}).")
+            right_footer_data.append([Paragraph("", normal_style)])
+        right_footer_table = Table(right_footer_data, colWidths=[3.25*inch])
+        right_footer_table.setStyle(TableStyle([
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ]))
+
+        # Footer tablosuna ekle
+        footer_row.append(left_footer_table)
+        footer_row.append(right_footer_table)
+        footer_table = Table([footer_row], colWidths=[3.25*inch, 3.25*inch])
+        footer_table.setStyle(TableStyle([
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ]))
+        elements.append(footer_table)
+        elements.append(Spacer(1, 0.2*inch))
+
+        # Arka plan resmi
+        bottom_background_path = "bottom_background.png"
+        if os.path.exists(bottom_background_path):
+            bottom_background = Image(bottom_background_path, width=6.5*inch, height=1*inch)
+            elements.append(bottom_background)
+        else:
+            print(f"Xəta: Arka plan resmi faylı ({bottom_background_path}) tapılmadı (Barkod ID {barkod_id}).")
+            elements.append(Paragraph("", normal_style))
+
+        # Renkli çubuklar
+        colored_bars_data = [
+            [""],  # Light blue bar
+            [""]   # Yellow bar
+        ]
+        colored_bars_table = Table(colored_bars_data, colWidths=[6.5*inch], rowHeights=[0.4*inch, 0.3*inch])
+        colored_bars_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.lightblue),
+            ('BACKGROUND', (0, 1), (-1, 1), colors.gold),
+        ]))
+        elements.append(colored_bars_table)
+
+        # PDF'i oluştur
+        doc.build(elements)
+        print(f"PDF oluşturuldu: {pdf_file} (Barkod ID {barkod_id})")
+        return pdf_file
+
+    except Exception as e:
+        print(f"PDF oluşturma xətası (Barkod ID {barkod_id}): {e}")
+        return None
+
+async def send_to_telegram(pdf_path, barkod_id, hasta_adi, branch_name, islemno, retries=3):
+    """PDF dosyasını Telegram'a gönderir, Flood Control üçün gözləmə əlavə edilib."""
+    # Hər mesaja göndərməzdən əvvəl məcburi 4 saniyə gözləmə (Spam filterinə düşməmək üçün)
+    await asyncio.sleep(4) 
+    
+    for attempt in range(1, retries + 1):
+        try:
+            bot = telegram.Bot(token=BOT_TOKEN)
+            with open(pdf_path, 'rb') as file:
+                await bot.send_document(
+                    chat_id=CHAT_ID,
+                    document=file,
+                    caption=f"🏥 Filial: {branch_name}\n🔬 Laboratuvar Sonuçları - Barkod ID: {barkod_id}\n👤 Hasta: {hasta_adi}\n💳 Kart Nömrəsi: {islemno}\n📅 Tarih: {datetime.now().strftime('%d.%m.%Y %H:%M')}"
+                )
+            print(f"PDF Telegram'a göndərildi ({branch_name} - Barkod ID {barkod_id})")
+            return True
+        except RetryAfter as e:
+            # Əgər Telegram bizi yenə də bloklasa, onun tələb etdiyi saniyə qədər gözləyib yenidən cəhd edirik
+            wait_time = int(e.retry_after) + 2
+            print(f"Telegram limiti! {wait_time} saniyə gözlənilir...")
+            await asyncio.sleep(wait_time)
+        except TimedOut as e:
+            print(f"Telegram göndərmə zaman aşımı (deneme {attempt}/{retries}, Barkod ID {barkod_id}): {e}")
+            if attempt < retries:
+                await asyncio.sleep(5)
+        except TelegramError as e:
+            print(f"Telegram göndərmə xətası (Barkod ID {barkod_id}): {e}")
+            return False
+        except Exception as e:
+            print(f"Beklenmeyen xəta (Barkod ID {barkod_id}): {e}")
+            return False
+    print(f"Bütün denemeler başarısız oldu. Telegram'a göndərilə bilmədi (Barkod ID {barkod_id}).")
+    return False
+
+async def process_all_barkods():
+    """Bütün filialları gəzir və nəticələri işləyir."""
+    total_success = 0
+    total_failure = 0
+
+    for branch in BRANCHES:
+        print(f"\n==========================================")
+        print(f"🏥 {branch['name']} filialı yoxlanılır...")
+        print(f"==========================================")
+        
+        barkod_ids = fetch_all_barkod_ids(branch["config"], branch["name"])
+        if not barkod_ids:
+            print(f"[{branch['name']}] filialında onaylanmış heç bir BARKODID tapılmadı.")
+            continue
+
+        for barkod_id in barkod_ids:
+            try:
+                print(f"\nBarkod ID {barkod_id} işlənir...")
+                # Verilənləri çək
+                data = fetch_lab_results(barkod_id, branch["config"], branch["name"])
+                if data:
+                    # PDF yarat
+                    pdf_path = create_pdf(barkod_id, data)
+                    if pdf_path:
+                        print(f"PDF uğurla saxlanıldı: {pdf_path} (Barkod ID {barkod_id})")
+                        # Telegram'a göndər
+                        if await send_to_telegram(pdf_path, barkod_id, data['hasta_adi'], branch['name'], data['islemno']):
+                            total_success += 1
+                        else:
+                            total_failure += 1
+                    else:
+                        print(f"PDF yaradıla bilmədi (Barkod ID {barkod_id}).")
+                        total_failure += 1
+                else:
+                    print(f"Verilənlər çəkilə bilmədi (Barkod ID {barkod_id}).")
+                    total_failure += 1
+            except Exception as e:
+                print(f"Xəta baş verdi (Barkod ID {barkod_id}): {e}")
+                total_failure += 1
+
+    print(f"\n✅ Proses tamamlandı: Cəmi {total_success} uğurlu, {total_failure} uğursuz hesabat göndərildi.")
+
+def main():
+    # Bütün filialları işlət
+    asyncio.run(process_all_barkods())
+
+if __name__ == "__main__":
+    main()
