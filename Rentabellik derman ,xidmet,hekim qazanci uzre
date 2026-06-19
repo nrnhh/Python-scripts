@@ -1,0 +1,199 @@
+# -*- coding: utf-8 -*-
+import os, warnings
+import pandas as pd
+import oracledb
+
+# ================== CONFIG ==================
+DB_USER = "NURAN"
+DB_PASS = "Nuran..2024!!"
+DB_DSN  = "172.18.79.23:1521/FONETAZ"
+INSTANT_CLIENT_DIR = r"C:\instant\instantclient_23_9"
+
+# ================== SQL SORĞULARI ==================
+
+SQL_XIDMET = """
+SELECT
+  TO_CHAR(T.HI_TARIH, 'YYYY-MM') AS AY,
+  T.SR_ADI AS SOBE_ADI,
+  CASE 
+    WHEN T.HI_ETAR IS NULL THEN 'Bilinmir'
+    WHEN TRUNC(T.HI_ETAR) - TRUNC(T.HI_ETAR, 'IW') = 6 THEN 'Növbə'
+    WHEN TRUNC(T.HI_ETAR) - TRUNC(T.HI_ETAR, 'IW') = 5 THEN 
+      CASE WHEN TO_CHAR(T.HI_ETAR, 'HH24:MI:SS') >= '08:00:00' AND TO_CHAR(T.HI_ETAR, 'HH24:MI:SS') <= '14:00:00' THEN 'Gündüz' ELSE 'Növbə' END
+    ELSE 
+      CASE WHEN TO_CHAR(T.HI_ETAR, 'HH24:MI:SS') >= '08:00:00' AND TO_CHAR(T.HI_ETAR, 'HH24:MI:SS') <= '17:00:00' THEN 'Gündüz' ELSE 'Növbə' END
+  END AS NOVBE,
+  COUNT(DISTINCT T.HK_ID) AS X_SAYI,
+  SUM(NVL(T.HI_MIKTAR,0)) AS XID_SAYI,
+  ROUND(SUM(CASE WHEN T.HK_KURUMID <> 812 THEN NVL(T.HI_HTUTAR,0) ELSE 0 END), 2) AS ODE_MEB,
+  ROUND(SUM(CASE WHEN T.HK_KURUMID <> 812 THEN NVL(T.HI_HTUTAR,0) ELSE 0 END)/1.18, 2) AS ODE_EDVSIZ,
+  ROUND(SUM(CASE WHEN T.HK_KURUMID <> 812 THEN NVL(T.HI_KTUTAR,0) ELSE 0 END), 2) AS TESK_MEB,
+  ROUND(SUM(CASE WHEN T.HK_KURUMID <> 812 THEN NVL(T.HI_KTUTAR,0) ELSE 0 END)/1.18, 2) AS TESK_EDVSIZ,
+  ROUND(SUM(CASE WHEN T.HK_KURUMID = 812 THEN NVL(T.HI_KTUTAR,0) + NVL(T.HI_HTUTAR,0) ELSE 0 END), 2) AS ICBARI
+FROM fonethbys.V_IST_GENEL_HIZMET T
+WHERE T.HI_TARIH >= TO_DATE('2026-01-01', 'YYYY-MM-DD') AND T.HI_TARIH <= TO_DATE('2026-12-31', 'YYYY-MM-DD')
+GROUP BY TO_CHAR(T.HI_TARIH, 'YYYY-MM'), T.SR_ADI, 
+  (CASE WHEN T.HI_ETAR IS NULL THEN 'Bilinmir' WHEN TRUNC(T.HI_ETAR)-TRUNC(T.HI_ETAR,'IW')=6 THEN 'Növbə' WHEN TRUNC(T.HI_ETAR)-TRUNC(T.HI_ETAR,'IW')=5 THEN (CASE WHEN TO_CHAR(T.HI_ETAR,'HH24:MI:SS') BETWEEN '08:00:00' AND '14:00:00' THEN 'Gündüz' ELSE 'Növbə' END) ELSE (CASE WHEN TO_CHAR(T.HI_ETAR,'HH24:MI:SS') BETWEEN '08:00:00' AND '17:00:00' THEN 'Gündüz' ELSE 'Növbə' END) END)
+"""
+
+SQL_XIDMET_GONDEREN = """
+SELECT
+  TO_CHAR(T.HI_TARIH, 'YYYY-MM') AS AY,
+  T.ISERVIS AS GONDEREN_SOBE,
+  CASE 
+    WHEN T.HI_ETAR IS NULL THEN 'Bilinmir'
+    WHEN TRUNC(T.HI_ETAR) - TRUNC(T.HI_ETAR, 'IW') = 6 THEN 'Növbə'
+    WHEN TRUNC(T.HI_ETAR) - TRUNC(T.HI_ETAR, 'IW') = 5 THEN 
+      CASE WHEN TO_CHAR(T.HI_ETAR, 'HH24:MI:SS') >= '08:00:00' AND TO_CHAR(T.HI_ETAR, 'HH24:MI:SS') <= '14:00:00' THEN 'Gündüz' ELSE 'Növbə' END
+    ELSE 
+      CASE WHEN TO_CHAR(T.HI_ETAR, 'HH24:MI:SS') >= '08:00:00' AND TO_CHAR(T.HI_ETAR, 'HH24:MI:SS') <= '17:00:00' THEN 'Gündüz' ELSE 'Növbə' END
+  END AS NOVBE,
+  COUNT(DISTINCT T.HK_ID) AS X_SAYI,
+  SUM(NVL(T.HI_MIKTAR,0)) AS XID_SAYI,
+  ROUND(SUM(CASE WHEN T.HK_KURUMID <> 812 THEN NVL(T.HI_HTUTAR,0) ELSE 0 END), 2) AS ODE_MEB,
+  ROUND(SUM(CASE WHEN T.HK_KURUMID <> 812 THEN NVL(T.HI_HTUTAR,0) ELSE 0 END)/1.18, 2) AS ODE_EDVSIZ,
+  ROUND(SUM(CASE WHEN T.HK_KURUMID <> 812 THEN NVL(T.HI_KTUTAR,0) ELSE 0 END), 2) AS TESK_MEB,
+  ROUND(SUM(CASE WHEN T.HK_KURUMID <> 812 THEN NVL(T.HI_KTUTAR,0) ELSE 0 END)/1.18, 2) AS TESK_EDVSIZ,
+  ROUND(SUM(CASE WHEN T.HK_KURUMID = 812 THEN NVL(T.HI_KTUTAR,0) + NVL(T.HI_HTUTAR,0) ELSE 0 END), 2) AS ICBARI
+FROM fonethbys.V_IST_GENEL_HIZMET T
+WHERE T.HI_TARIH >= TO_DATE('2026-01-01', 'YYYY-MM-DD') AND T.HI_TARIH <= TO_DATE('2026-12-31', 'YYYY-MM-DD')
+GROUP BY TO_CHAR(T.HI_TARIH, 'YYYY-MM'), T.ISERVIS, 
+  (CASE WHEN T.HI_ETAR IS NULL THEN 'Bilinmir' WHEN TRUNC(T.HI_ETAR)-TRUNC(T.HI_ETAR,'IW')=6 THEN 'Növbə' WHEN TRUNC(T.HI_ETAR)-TRUNC(T.HI_ETAR,'IW')=5 THEN (CASE WHEN TO_CHAR(T.HI_ETAR,'HH24:MI:SS') BETWEEN '08:00:00' AND '14:00:00' THEN 'Gündüz' ELSE 'Növbə' END) ELSE (CASE WHEN TO_CHAR(T.HI_ETAR,'HH24:MI:SS') BETWEEN '08:00:00' AND '17:00:00' THEN 'Gündüz' ELSE 'Növbə' END) END)
+"""
+
+SQL_DERMAN = """
+SELECT
+  TO_CHAR(T.TARIH, 'YYYY-MM') AS AY,
+  CASE 
+    WHEN T.ETAR IS NULL THEN 'Bilinmir'
+    WHEN TRUNC(T.ETAR) - TRUNC(T.ETAR, 'IW') = 6 THEN 'Növbə'
+    WHEN TRUNC(T.ETAR) - TRUNC(T.ETAR, 'IW') = 5 THEN 
+      CASE WHEN TO_CHAR(T.ETAR, 'HH24:MI:SS') >= '08:00:00' AND TO_CHAR(T.ETAR, 'HH24:MI:SS') <= '14:00:00' THEN 'Gündüz' ELSE 'Növbə' END
+    ELSE 
+      CASE WHEN TO_CHAR(T.ETAR, 'HH24:MI:SS') >= '08:00:00' AND TO_CHAR(T.ETAR, 'HH24:MI:SS') <= '17:00:00' THEN 'Gündüz' ELSE 'Növbə' END
+  END AS NOVBE,
+  t.DEPOADI AS DEPO_ADI,
+  COUNT(DISTINCT CASE WHEN TRIM(T.ODEMETURU) IN ('Ücretli', 'ücretli') THEN T.HASTA_HKID END) AS ODE_X_SAYI,
+  COUNT(DISTINCT CASE WHEN TRIM(T.ODEMETURU) IN ('Sigortalı', 'sigortalı') THEN T.HASTA_HKID END) AS SIG_X_SAYI,
+  COUNT(DISTINCT T.HASTA_HKID) AS TOP_X_SAYI,
+  ROUND(SUM(CASE WHEN TRIM(T.ODEMETURU) IN ('Ücretli', 'ücretli') THEN NVL(T.SNLTUTAR, 0) ELSE 0 END), 2) AS ODE_MEB,
+  ROUND(SUM(CASE WHEN TRIM(T.ODEMETURU) IN ('Ücretli', 'ücretli') THEN NVL(T.SNLALISTUTAR, 0) ELSE 0 END), 2) AS ODE_ALIS,
+  ROUND(SUM(CASE WHEN TRIM(T.ODEMETURU) IN ('Sigortalı', 'sigortalı') THEN NVL(T.SNLTUTAR, 0) ELSE 0 END), 2) AS SIG_MEB,
+  ROUND(SUM(CASE WHEN TRIM(T.ODEMETURU) IN ('Sigortalı', 'sigortalı') THEN NVL(T.SNLALISTUTAR, 0) ELSE 0 END), 2) AS SIG_ALIS,
+  ROUND(SUM(NVL(T.SNLTUTAR, 0)), 2) AS TOP_MEB
+FROM fonethbys.V_STOK_LIST_CIKISFISDETAY T
+WHERE T.FORMTYPE = 2 AND T.TARIH >= TO_DATE('2026-01-01', 'YYYY-MM-DD') AND T.TARIH <= TO_DATE('2026-12-31', 'YYYY-MM-DD')
+GROUP BY TO_CHAR(T.TARIH, 'YYYY-MM'), t.DEPOADI,
+  (CASE WHEN T.ETAR IS NULL THEN 'Bilinmir' WHEN TRUNC(T.ETAR)-TRUNC(T.ETAR,'IW')=6 THEN 'Növbə' WHEN TRUNC(T.ETAR)-TRUNC(T.ETAR,'IW')=5 THEN (CASE WHEN TO_CHAR(T.ETAR,'HH24:MI:SS') BETWEEN '08:00:00' AND '14:00:00' THEN 'Gündüz' ELSE 'Növbə' END) ELSE (CASE WHEN TO_CHAR(T.ETAR,'HH24:MI:SS') BETWEEN '08:00:00' AND '17:00:00' THEN 'Gündüz' ELSE 'Növbə' END) END)
+"""
+
+SQL_HAKEDIS = """
+SELECT
+    TO_CHAR(t.HI_TARIH, 'YYYY-MM') AS AY,
+    CASE 
+        WHEN h.HI_ETAR IS NULL THEN 'Bilinmir'
+        WHEN TRUNC(h.HI_ETAR) - TRUNC(h.HI_ETAR, 'IW') = 6 THEN 'Növbə'
+        WHEN TRUNC(h.HI_ETAR) - TRUNC(h.HI_ETAR, 'IW') = 5 THEN 
+            CASE WHEN TO_CHAR(h.HI_ETAR, 'HH24:MI:SS') BETWEEN '08:00:00' AND '14:00:00' THEN 'Gündüz' ELSE 'Növbə' END
+        ELSE 
+            CASE WHEN TO_CHAR(h.HI_ETAR, 'HH24:MI:SS') BETWEEN '08:00:00' AND '17:00:00' THEN 'Gündüz' ELSE 'Növbə' END
+    END AS NOVBE,
+    t.SR_ADI AS SOBE,
+    COUNT(DISTINCT t.HK_ID) AS X_SAYI,
+    ROUND(SUM(t.HI_TUTAR), 2) AS TOP_XID_MEB,
+    ROUND(SUM(CASE WHEN t.HS_ID = '1' THEN t.HI_TUTAR ELSE 0 END), 2) AS ODE_MEB,
+    ROUND(SUM(CASE WHEN t.HS_ID = '2' THEN t.HI_TUTAR ELSE 0 END), 2) AS SIG_MEB,
+    ROUND(SUM(t.HAKTUTAR), 2) AS HK_QAZANC
+FROM fonethbys.V_HAKEDIS_RAPOR t
+LEFT JOIN fonethbys.V_HAKEDIS_HESAP h ON t.HI_ID = h.HI_ID
+WHERE t.HI_TARIH >= TO_DATE('2026-01-01', 'YYYY-MM-DD') AND t.HI_TARIH <= TO_DATE('2026-12-31', 'YYYY-MM-DD')
+GROUP BY TO_CHAR(t.HI_TARIH, 'YYYY-MM'), t.SR_ADI,
+    (CASE WHEN h.HI_ETAR IS NULL THEN 'Bilinmir' WHEN TRUNC(h.HI_ETAR)-TRUNC(h.HI_ETAR,'IW')=6 THEN 'Növbə' WHEN TRUNC(h.HI_ETAR)-TRUNC(h.HI_ETAR,'IW')=5 THEN (CASE WHEN TO_CHAR(h.HI_ETAR,'HH24:MI:SS') BETWEEN '08:00:00' AND '14:00:00' THEN 'Gündüz' ELSE 'Növbə' END) ELSE (CASE WHEN TO_CHAR(h.HI_ETAR,'HH24:MI:SS') BETWEEN '08:00:00' AND '17:00:00' THEN 'Gündüz' ELSE 'Növbə' END) END)
+"""
+
+def get_unique_filename(base_name):
+    if not os.path.exists(base_name): return base_name
+    filename, ext = os.path.splitext(base_name)
+    counter = 1
+    new_name = f"{filename}_{counter}{ext}"
+    while os.path.exists(new_name):
+        counter += 1
+        new_name = f"{filename}_{counter}{ext}"
+    return new_name
+
+def main():
+    warnings.filterwarnings("ignore")
+    try: oracledb.init_oracle_client(lib_dir=INSTANT_CLIENT_DIR)
+    except: pass
+
+    file_name = get_unique_filename("2026-Babek rentabel.xlsx")
+    conn = oracledb.connect(user=DB_USER, password=DB_PASS, dsn=DB_DSN)
+    
+    with pd.ExcelWriter(file_name, engine='xlsxwriter') as writer:
+        workbook = writer.book
+        money_fmt = workbook.add_format({'num_format': '#,##0.00', 'border': 1, 'align': 'right'})
+        text_fmt = workbook.add_format({'border': 1, 'align': 'left'})
+
+        jobs = [
+            (SQL_XIDMET, 'Xidmet_2026', {
+                "AY": "Ay", "SOBE_ADI": "İcra edən şöbə", "NOVBE": "Növbə tipi", "X_SAYI": "Xəstə sayı", 
+                "XID_SAYI": "Xidmət sayı", "ODE_MEB": "Ödənişli məbləğ", "ODE_EDVSIZ": "ƏDV-siz ödənişli",
+                "TESK_MEB": "Təşkilat məbləği", "TESK_EDVSIZ": "ƏDV-siz təşkilat", "ICBARI": "İcbari toplam"
+            }),
+            (SQL_XIDMET_GONDEREN, 'Xidmet_Gonderen_2026', {
+                "AY": "Ay", "GONDEREN_SOBE": "Göndərən şöbə", "NOVBE": "Növbə tipi", "X_SAYI": "Xəstə sayı", 
+                "XID_SAYI": "Xidmət sayı", "ODE_MEB": "Ödənişli məbləğ", "ODE_EDVSIZ": "ƏDV-siz ödənişli",
+                "TESK_MEB": "Təşkilat məbləği", "TESK_EDVSIZ": "ƏDV-siz təşkilat", "ICBARI": "İcbari toplam"
+            }),
+            (SQL_DERMAN, 'Derman_2026', {
+                "AY": "Ay", "NOVBE": "Növbə tipi", "DEPO_ADI": "Şöbə anbar", "ODE_X_SAYI": "Ödənişli xəstə",
+                "SIG_X_SAYI": "Sığortalı xəstə", "TOP_X_SAYI": "Ümumi xəstə", "ODE_MEB": "Ödənişli məbləğ",
+                "ODE_ALIS": "Ödənişli alış", "SIG_MEB": "Sığortalı məbləğ", "SIG_ALIS": "Sığortalı alış",
+                "TOP_MEB": "Ümumi məbləğ"
+            }),
+            (SQL_HAKEDIS, 'Hakedis_2026', {
+                "AY": "Ay", "NOVBE": "Növbə tipi", "SOBE": "Şöbə adı", "X_SAYI": "Xəstə sayı",
+                "TOP_XID_MEB": "Ümumi xidmət məbləği", "ODE_MEB": "Ödənişli məbləğ", 
+                "SIG_MEB": "Sığortalı məbləğ", "HK_QAZANC": "Həkim qazancı (ümumi)"
+            })
+        ]
+
+        for sql, sheet, col_map in jobs:
+            df = pd.read_sql(sql, conn)
+            df = df.fillna(0)
+            df.rename(columns=col_map, inplace=True)
+            
+            # Məlumatları yazırıq
+            df.to_excel(writer, sheet_name=sheet, startrow=1, header=False, index=False)
+            
+            worksheet = writer.sheets[sheet]
+            (max_row, max_col) = df.shape
+            
+            # Sütun ayarları və SUM funksiyası
+            column_settings = []
+            for i, col_name in enumerate(df.columns):
+                setting = {'header': col_name}
+                if i == 0:
+                    setting['total_string'] = 'Cəmi' 
+                elif i >= 3: 
+                    setting['total_function'] = 'sum'
+                    setting['format'] = money_fmt
+                column_settings.append(setting)
+
+            # Cədvəli yaradırıq
+            worksheet.add_table(0, 0, max_row + 1, max_col - 1, {
+                'columns': column_settings,
+                'style': 'Table Style Medium 9',
+                'total_row': True, 
+                'name': sheet.replace(" ", "_")
+            })
+
+            worksheet.set_column(0, 2, 18, text_fmt)
+            worksheet.set_column(3, max_col - 1, 20, money_fmt)
+            worksheet.freeze_panes(1, 0)
+
+    conn.close()
+    print(f"🚀 Tamamlandı! Fayl: {os.path.abspath(file_name)}")
+
+if __name__ == "__main__":
+    main()
