@@ -1,0 +1,221 @@
+"""
+FONET — Bütün depolar üzrə 31.12.2025 qalıq ilə 2026 devir-girişi müqayisəsi
+============================================================================
+Bu skript Oracle-a Thick (Instant Client) rejimində qoşulub, yeni SQL sorğusu 
+vasitəsilə fərqləri və vəziyyəti (VEZIYYET) birbaşa DB səviyyəsində hesablayır 
+ve Excel hesabatını birbaşa DESKTOP-a yazır.
+
+Tələb olunan paketlər:
+    pip install oracledb pandas openpyxl
+
+İstifadə:
+    python mu.py
+"""
+
+import os
+import oracledb
+import pandas as pd
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+from datetime import datetime
+
+# Köhnə Oracle versiyaları üçün Thick rejimini aktivləşdiririk
+oracledb.init_oracle_client(lib_dir=r"C:\instant\instantclient_23_9")
+
+# ------------------------------------------------------------------
+# 1) BAĞLANTI MƏLUMATLARI (MƏRKƏZ IP)
+# ------------------------------------------------------------------
+DB_CONFIG = {
+    "user": "NURAN",
+    "password": "Nuran..2024!!",
+    "dsn": "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=10.20.0.10)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=FONETAZ)))"
+}
+
+FARQ_TOLERANCE = 0.01            # Bundan kiçik fərqlər fərq sayılmır
+
+SQL_QUERY = """
+WITH
+g AS (
+    SELECT
+        gd.depoid, gd.stokid,
+        SUM(CASE WHEN gd.formtype = 3 AND gd.stokonay = 1
+                  AND gd.tarih >= TO_DATE('01.01.2025','DD.MM.YYYY') AND gd.tarih < TO_DATE('31.12.2025','DD.MM.YYYY')
+             THEN gd.miktar*gd.birimcarpan END) AS devirgiris,
+        SUM(CASE WHEN gd.formtype = 3 AND gd.stokonay = 1
+                  AND gd.tarih >= TO_DATE('01.01.2025','DD.MM.YYYY') AND gd.tarih < TO_DATE('31.12.2025','DD.MM.YYYY')
+             THEN (gd.miktar*gd.fiyatkdv) * ((100-NVL(gd.iskonto_oran,0))/100) END) AS devirgiristutar,
+        SUM(CASE WHEN gd.formtype = 3 AND gd.stokonay = 1
+                  AND gd.tarih >= TO_DATE('31.12.2025','DD.MM.YYYY') AND gd.tarih < TO_DATE('01.01.2026','DD.MM.YYYY')
+             THEN gd.miktar*gd.birimcarpan END) AS donemgiris,
+        SUM(CASE WHEN gd.formtype = 3 AND gd.stokonay = 1
+                  AND gd.tarih >= TO_DATE('31.12.2025','DD.MM.YYYY') AND gd.tarih < TO_DATE('01.01.2026','DD.MM.YYYY')
+             THEN (gd.miktar*gd.fiyatkdv) * ((100-NVL(gd.iskonto_oran,0))/100) END) AS donemgiristutar
+    FROM fonethbys.STOK_GIRISDETAY gd
+    WHERE gd.tarih >= TO_DATE('01.01.2025','DD.MM.YYYY') AND gd.tarih < TO_DATE('01.01.2026','DD.MM.YYYY')
+    GROUP BY gd.depoid, gd.stokid
+),
+c AS (
+    SELECT
+        cd.depoid, cd.stokid,
+        SUM(CASE WHEN cd.formtype IN (2,3,10)
+                  AND cd.tarih >= TO_DATE('01.01.2025','DD.MM.YYYY') AND cd.tarih < TO_DATE('31.12.2025','DD.MM.YYYY')
+             THEN cd.miktar*cd.birimcarpan END) AS devircikis,
+        SUM(CASE WHEN cd.formtype IN (2,3,10)
+                  AND cd.tarih >= TO_DATE('01.01.2025','DD.MM.YYYY') AND cd.tarih < TO_DATE('31.12.2025','DD.MM.YYYY')
+             THEN cd.miktar*cd.alisfiyat END) AS devircikistutar,
+        SUM(CASE WHEN cd.formtype IN (2,3,10)
+                  AND cd.tarih >= TO_DATE('31.12.2025','DD.MM.YYYY') AND cd.tarih < TO_DATE('01.01.2026','DD.MM.YYYY')
+             THEN cd.miktar*cd.birimcarpan END) AS donemcikis,
+        SUM(CASE WHEN cd.formtype IN (2,3,10)
+                  AND cd.tarih >= TO_DATE('31.12.2025','DD.MM.YYYY') AND cd.tarih < TO_DATE('01.01.2026','DD.MM.YYYY')
+             THEN cd.miktar*cd.alisfiyat END) AS donemcikistutar
+    FROM fonethbys.STOK_CIKISDETAY cd
+    WHERE cd.tarih >= TO_DATE('01.01.2025','DD.MM.YYYY') AND cd.tarih < TO_DATE('01.01.2026','DD.MM.YYYY')
+    GROUP BY cd.depoid, cd.stokid
+),
+qaliq_2025 AS (
+    SELECT
+        NVL(g.depoid,c.depoid) AS depoid,
+        NVL(g.stokid,c.stokid) AS stokid,
+        NVL(g.devirgiris,0)-NVL(c.devircikis,0) + NVL(g.donemgiris,0)-NVL(c.donemcikis,0)             AS kalan_miqdar,
+        NVL(g.devirgiristutar,0)-NVL(c.devircikistutar,0) + NVL(g.donemgiristutar,0)-NVL(c.donemcikistutar,0) AS kalan_meblag
+    FROM g FULL OUTER JOIN c ON c.depoid=g.depoid AND c.stokid=g.stokid
+),
+devir_2026 AS (
+    SELECT
+        t.depoid, t.stokid,
+        SUM(t.miktar*t.birimcarpan)                    AS devir_miqdar,
+        SUM(t.tutar)                                   AS devir_meblag,
+        SUM(t.miktar*t.birimcarpan - t.toplamcikis)     AS giris_qalan
+    FROM fonethbys.V_STOK_LIST_GIRISFISDETAY t
+    WHERE (t.formtype = 3 OR t.formtype = 6)
+      AND t.tarih >= TO_DATE('01.01.2026','DD.MM.YYYY') AND t.tarih < TO_DATE('04.01.2026','DD.MM.YYYY')
+    GROUP BY t.depoid, t.stokid
+)
+SELECT
+    da.sr_id                                        AS DEPOID,
+    da.sr_adi                                        AS DEPOADI,
+    s.id                                             AS STOKID,
+    s.kodu                                           AS KODU,
+    s.adi                                            AS MALZEMEADI,
+    NVL(q.kalan_miqdar,0)                            AS QALIQ_2025_MIQDAR,
+    NVL(d.devir_miqdar,0)                            AS DEVIR_2026_MIQDAR,
+    NVL(d.devir_miqdar,0)-NVL(q.kalan_miqdar,0)       AS FARQ_MIQDAR,
+    NVL(q.kalan_meblag,0)                            AS QALIQ_2025_MEBLAG,
+    NVL(d.devir_meblag,0)                            AS DEVIR_2026_MEBLAG,
+    NVL(d.devir_meblag,0)-NVL(q.kalan_meblag,0)       AS FARQ_MEBLAG,
+    CASE
+        WHEN NVL(q.kalan_meblag,0)=0 AND NVL(d.devir_meblag,0)<>0 THEN 'PHANTOM: 2025 qaligi yoxdur, 2026-da var'
+        WHEN NVL(q.kalan_meblag,0)<>0 AND NVL(d.devir_meblag,0)=0 THEN 'ITKI: 2025 qaligi 2026-ya kecmeyib'
+        WHEN ABS(NVL(d.devir_meblag,0)-NVL(q.kalan_meblag,0))>0.01 THEN 'FERQ VAR'
+        ELSE 'OK'
+    END AS VEZIYYET
+FROM qaliq_2025 q
+FULL OUTER JOIN devir_2026 d ON d.depoid=q.depoid AND d.stokid=q.stokid
+JOIN FONETHBYSADM.STOK_TNM_STOK s ON s.id = NVL(q.stokid,d.stokid)
+JOIN FONETHBYSADM.H_SERVIS da     ON da.sr_id = NVL(q.depoid,d.depoid)
+WHERE ABS(NVL(d.devir_meblag,0)-NVL(q.kalan_meblag,0)) > 0.01
+ORDER BY da.sr_adi, ABS(NVL(d.devir_meblag,0)-NVL(q.kalan_meblag,0)) DESC
+"""
+
+COLS_MAPPING = {
+    "DEPOADI": "Depo Adı",
+    "STOKID": "Stok İdentifikatoru (ID)",
+    "KODU": "Material Kodu",
+    "MALZEMEADI": "Materialın Adı",
+    "QALIQ_2025_MIQDAR": "2025 Qalıq Miqdarı",
+    "DEVIR_2026_MIQDAR": "2026 Devir Miqdarı",
+    "FARQ_MIQDAR": "Miqdar Fərqi",
+    "QALIQ_2025_MEBLAG": "2025 Qalıq Məbləği",
+    "DEVIR_2026_MEBLAG": "2026 Devir Məbləği",
+    "FARQ_MEBLAG": "Məbləğ Fərqi",
+    "VEZIYYET": "Audit Statusu"
+}
+
+def fetch_data():
+    with oracledb.connect(
+        user=DB_CONFIG["user"],
+        password=DB_CONFIG["password"],
+        dsn=DB_CONFIG["dsn"]
+    ) as conn:
+        df = pd.read_sql(SQL_QUERY, conn)
+    df.columns = [c.upper() for c in df.columns]
+    return df
+
+def build_report(df: pd.DataFrame, out_path: str):
+    anomalies = df[df["VEZIYYET"] != "OK"].copy()
+    wb = openpyxl.Workbook()
+    
+    FONT_NAME = "Segoe UI"
+    header_font = Font(name=FONT_NAME, size=10, bold=True, color="FFFFFF")
+    header_fill = PatternFill("solid", fgColor="1F497D") # Korporativ rəsmi göy rəng
+    normal_font = Font(name=FONT_NAME, size=10)
+    red_fill = PatternFill("solid", fgColor="FADBD8") # Səliqəli yumşaq qırmızı
+    thin = Side(style="thin", color="D9D9D9")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    def write_sheet(ws, data, cols_keys):
+        for i, col_key in enumerate(cols_keys, start=1):
+            pretty_name = COLS_MAPPING.get(col_key, col_key)
+            cell = ws.cell(row=1, column=i, value=pretty_name)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            cell.border = border
+            
+        for r, (_, row) in enumerate(data.iterrows(), start=2):
+            for c, col_key in enumerate(cols_keys, start=1):
+                val = row[col_key]
+                cell = ws.cell(row=r, column=c, value=val)
+                cell.font = normal_font
+                cell.border = border
+                
+                if isinstance(val, (int, float)):
+                    cell.number_format = '#,##0.00' # Rəhbərlik üçün maliyyə formatı
+                    cell.alignment = Alignment(horizontal="right")
+                elif col_key in ["STOKID", "KODU"]:
+                    cell.alignment = Alignment(horizontal="center")
+                else:
+                    cell.alignment = Alignment(horizontal="left")
+
+                if col_key == "FARQ_MEBLAG" and abs(val) > FARQ_TOLERANCE:
+                    cell.fill = red_fill
+                    
+        for i, col_key in enumerate(cols_keys, start=1):
+            pretty_name = COLS_MAPPING.get(col_key, col_key)
+            max_len = max(
+                data[col_key].astype(str).map(len).max() if len(data) else 0,
+                len(pretty_name)
+            )
+            ws.column_dimensions[get_column_letter(i)].width = max(15, min(45, max_len + 4))
+            
+        ws.row_dimensions[1].height = 28
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = f"A1:{get_column_letter(len(cols_keys))}{len(data)+1}"
+
+    cols_keys = ["DEPOADI", "STOKID", "KODU", "MALZEMEADI",
+                 "QALIQ_2025_MIQDAR", "DEVIR_2026_MIQDAR", "FARQ_MIQDAR",
+                 "QALIQ_2025_MEBLAG", "DEVIR_2026_MEBLAG", "FARQ_MEBLAG", "VEZIYYET"]
+
+    ws1 = wb.active
+    ws1.title = "Kənarlaşmalar"
+    write_sheet(ws1, anomalies, cols_keys)
+
+    ws2 = wb.create_sheet("Tam Siyahı")
+    write_sheet(ws2, df.sort_values(["DEPOADI", "MALZEMEADI"]), cols_keys)
+
+    wb.save(out_path)
+    print(f"Hesabat uğurla Masaüstünə (Desktop) yazıldı: {out_path}")
+    print(f"Cəmi sətir: {len(df)}  |  Kənarlaşma sayı: {len(anomalies)}")
+
+if __name__ == "__main__":
+    df = fetch_data()
+    ts = datetime.now().strftime("%Y%m%d_%H%M")
+    
+    # Birbaşa istifadəçinin Desktop yolunu tapan dinamik kod hissəsi:
+    desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
+    file_name = f"Qaliq_Devir_Muqayise_Butun_Depolar_{ts}.xlsx"
+    full_output_path = os.path.join(desktop_path, file_name)
+    
+    build_report(df, full_output_path)
