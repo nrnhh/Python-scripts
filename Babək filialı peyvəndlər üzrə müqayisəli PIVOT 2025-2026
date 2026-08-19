@@ -1,0 +1,213 @@
+"""
+FONET — Peyvəndlər (PEYV) üzrə 2025 və 2026 İllərinin PIVOT Müqayisəsi
+======================================================================
+Bu skript stok çıxışlarına (V_STOK_LIST_CIKISFISDETAY) əsaslanaraq 
+peyvəndlərin aylıq istifadə MİQDARLARINI (SUM(MIKTAR)) hesablayır 
+və Excel hesabatını DESKTOP-a yazır.
+"""
+
+import os
+import oracledb
+import pandas as pd
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+from datetime import datetime
+
+# Oracle Thick rejiminin aktivləşdirilməsi
+oracledb.init_oracle_client(lib_dir=r"C:\instant\instantclient_23_9")
+
+# ------------------------------------------------------------------
+# 1) BAĞLANTI MƏLUMATLARI 
+# ------------------------------------------------------------------
+DB_CONFIG = {
+    "user": "NURAN",
+    "password": "Nuran..2024!!",
+    "dsn": "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=10.20.0.10)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=FONETAZ)))"
+}
+
+# ------------------------------------------------------------------
+# 2) SQL SORĞUSU (Yalnız PEYVƏNDLƏR və SUM(MIKTAR) məntiqi)
+# ------------------------------------------------------------------
+SQL_QUERY = """
+SELECT 
+    TRIM(SNLMALZEMEADI) AS PEYVEND_ADI,
+    TO_CHAR(TARIH, 'MM') AS AY_NOMRESI,
+    TRIM(TO_CHAR(TARIH, 'Month', 'NLS_DATE_LANGUAGE=AZERBAIJANI')) AS AY_ADI,
+    SUM(CASE WHEN TO_CHAR(TARIH, 'YYYY') = '2025' THEN MIKTAR ELSE 0 END) AS SAY_2025,
+    SUM(CASE WHEN TO_CHAR(TARIH, 'YYYY') = '2026' THEN MIKTAR ELSE 0 END) AS SAY_2026
+FROM 
+    fonethbys.V_STOK_LIST_CIKISFISDETAY
+WHERE 
+    TO_CHAR(TARIH, 'YYYY') IN ('2025', '2026')
+    AND UPPER(SNLMALZEMEADI) LIKE '%PEYV%'
+GROUP BY 
+    TRIM(SNLMALZEMEADI),
+    TO_CHAR(TARIH, 'MM'),
+    TO_CHAR(TARIH, 'Month', 'NLS_DATE_LANGUAGE=AZERBAIJANI')
+"""
+
+def fetch_data():
+    with oracledb.connect(
+        user=DB_CONFIG["user"],
+        password=DB_CONFIG["password"],
+        dsn=DB_CONFIG["dsn"]
+    ) as conn:
+        df = pd.read_sql(SQL_QUERY, conn)
+    return df
+
+def build_pivot_report(df: pd.DataFrame, out_path: str):
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Peyvəndlərin Pivot Müqayisəsi"
+
+    # --- Dizayn Stilləri ---
+    FONT_NAME = "Segoe UI"
+    header_font = Font(name=FONT_NAME, size=10, bold=True, color="FFFFFF")
+    month_fill = PatternFill("solid", fgColor="1F497D")
+    sub_fill = PatternFill("solid", fgColor="2F75B5")
+    total_fill = PatternFill("solid", fgColor="D9E1F2")
+    
+    red_fill = PatternFill("solid", fgColor="FFC7CE")
+    red_font = Font(name=FONT_NAME, size=10, bold=True, color="9C0006")
+    green_fill = PatternFill("solid", fgColor="C6EFCE")
+    green_font = Font(name=FONT_NAME, size=10, bold=True, color="006100")
+    
+    normal_font = Font(name=FONT_NAME, size=10)
+    bold_font = Font(name=FONT_NAME, size=10, bold=True)
+    
+    thin = Side(style="thin", color="BFBFBF")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    def style_cell(cell, font, fill=None, align="center"):
+        cell.font = font
+        if fill:
+            cell.fill = fill
+        cell.alignment = Alignment(horizontal=align, vertical="center", wrap_text=True)
+        cell.border = border
+
+    # --- Məlumatların Strukturlaşdırılması ---
+    months = df[['AY_NOMRESI', 'AY_ADI']].drop_duplicates().sort_values('AY_NOMRESI').to_dict('records')
+    vaccines = sorted(df['PEYVEND_ADI'].dropna().unique())
+
+    data_dict = {}
+    for _, row in df.iterrows():
+        peyv = row['PEYVEND_ADI']
+        if pd.isna(peyv):
+            continue
+        if peyv not in data_dict:
+            data_dict[peyv] = {}
+        data_dict[peyv][row['AY_NOMRESI']] = {
+            '2025': row['SAY_2025'],
+            '2026': row['SAY_2026']
+        }
+
+    # --- Başlıqların Yazılması ---
+    c1 = ws.cell(row=1, column=1, value="Peyvəndin Adı")
+    style_cell(c1, header_font, month_fill, "center")
+    ws.merge_cells(start_row=1, start_column=1, end_row=2, end_column=1)
+
+    col_idx = 2
+    for m in months:
+        c_month = ws.cell(row=1, column=col_idx, value=m['AY_ADI'])
+        style_cell(c_month, header_font, month_fill, "center")
+        ws.merge_cells(start_row=1, start_column=col_idx, end_row=1, end_column=col_idx+2)
+        
+        for offset, title in enumerate(["2025 Miqdar", "2026 Miqdar", "Fərq"]):
+            c_sub = ws.cell(row=2, column=col_idx + offset, value=title)
+            style_cell(c_sub, header_font, sub_fill, "center")
+            
+        col_idx += 3
+
+    # İllik Yekun
+    c_tot = ws.cell(row=1, column=col_idx, value="İLLİK ÜMUMİ YEKUN (MİQDAR)")
+    style_cell(c_tot, header_font, month_fill, "center")
+    ws.merge_cells(start_row=1, start_column=col_idx, end_row=1, end_column=col_idx+2)
+    for offset, title in enumerate(["2025 Cəm", "2026 Cəm", "Ümumi Fərq"]):
+        c_sub = ws.cell(row=2, column=col_idx + offset, value=title)
+        style_cell(c_sub, header_font, sub_fill, "center")
+
+    # --- Sətirlərin Yazılması ---
+    current_row = 3
+    col_totals = {} 
+
+    for peyv in vaccines:
+        c_name = ws.cell(row=current_row, column=1, value=peyv)
+        style_cell(c_name, normal_font, align="left")
+        
+        c_idx = 2
+        row_tot_25 = 0
+        row_tot_26 = 0
+        
+        for m in months:
+            m_num = m['AY_NOMRESI']
+            vals = data_dict.get(peyv, {}).get(m_num, {'2025': 0, '2026': 0})
+            v25, v26 = vals['2025'], vals['2026']
+            diff = v26 - v25
+            
+            row_tot_25 += v25
+            row_tot_26 += v26
+            
+            col_totals[c_idx] = col_totals.get(c_idx, 0) + v25
+            col_totals[c_idx+1] = col_totals.get(c_idx+1, 0) + v26
+            col_totals[c_idx+2] = col_totals.get(c_idx+2, 0) + diff
+            
+            c_v25 = ws.cell(row=current_row, column=c_idx, value=v25)
+            c_v26 = ws.cell(row=current_row, column=c_idx+1, value=v26)
+            c_diff = ws.cell(row=current_row, column=c_idx+2, value=diff)
+            
+            for cell in (c_v25, c_v26, c_diff):
+                style_cell(cell, normal_font)
+                cell.number_format = '#,##0.##' # Əgər kəsr miqdar varsa dəstəkləyir
+                if cell.value == 0: cell.value = "-" 
+                
+            if diff > 0:
+                style_cell(c_diff, green_font, green_fill)
+            elif diff < 0:
+                style_cell(c_diff, red_font, red_fill)
+                
+            c_idx += 3
+            
+        # İllik Yekun Hesablama
+        c_rt25 = ws.cell(row=current_row, column=c_idx, value=row_tot_25)
+        c_rt26 = ws.cell(row=current_row, column=c_idx+1, value=row_tot_26)
+        c_rdiff = ws.cell(row=current_row, column=c_idx+2, value=row_tot_26 - row_tot_25)
+        
+        for cell in (c_rt25, c_rt26, c_rdiff):
+            style_cell(cell, bold_font, total_fill)
+            cell.number_format = '#,##0.##'
+            
+        col_totals[c_idx] = col_totals.get(c_idx, 0) + row_tot_25
+        col_totals[c_idx+1] = col_totals.get(c_idx+1, 0) + row_tot_26
+        col_totals[c_idx+2] = col_totals.get(c_idx+2, 0) + (row_tot_26 - row_tot_25)
+            
+        current_row += 1
+
+    # --- Ən Altda Ümumi Yekun Sətri ---
+    c_bot = ws.cell(row=current_row, column=1, value="BÜTÜN PEYVƏNDLƏR ÜZRƏ CƏM MİQDAR")
+    style_cell(c_bot, header_font, month_fill, "right")
+    
+    for c_index, total_val in col_totals.items():
+        cell = ws.cell(row=current_row, column=c_index, value=total_val)
+        style_cell(cell, header_font, month_fill)
+        cell.number_format = '#,##0.##'
+
+    # --- Ekran Formatlaması ---
+    ws.column_dimensions['A'].width = 50 # Peyvənd adları adətən uzun olur
+    for i in range(2, col_idx + 3):
+        ws.column_dimensions[get_column_letter(i)].width = 12
+        
+    ws.freeze_panes = "B3" 
+
+    wb.save(out_path)
+    print(f"Pivot Hesabat uğurla Masaüstünə yazıldı: {out_path}")
+
+if __name__ == "__main__":
+    df = fetch_data()
+    ts = datetime.now().strftime("%Y%m%d_%H%M")
+    
+    desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
+    file_name = f"Pivot_Peyvendler_Muqayise_2025_2026_{ts}.xlsx"
+    full_output_path = os.path.join(desktop_path, file_name)
+    
+    build_pivot_report(df, full_output_path)
