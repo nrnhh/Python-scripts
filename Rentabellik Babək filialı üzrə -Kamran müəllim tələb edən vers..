@@ -1,0 +1,999 @@
+# -*- coding: utf-8 -*-
+"""
+BÜTÜN ŞÖBƏLƏR ÜZRƏ MALİYYƏ REYESTRİ (FONET / Oracle)
+
+Seçmə qaydası: xəstənin MÜRACİƏT TARİXİ (H_HASTAKAYIT.HK_MURACAATTAR) seçilən ayda olan xəstələr.
+Bu xəstələrin bütün xidmət / dərman / hakediş / ödənişləri --asof tarixinə qədər (defolt: bu gün) götürülür.
+
+İstifadə:
+    python sobe_ayliq_hesabat.py                        # cari ilin yanvarından bu günə qədər
+    python sobe_ayliq_hesabat.py --from 2026-10 --to 2026-10
+    python sobe_ayliq_hesabat.py --from 2026-10 --asof 2026-10-31
+    python sobe_ayliq_hesabat.py --demo                 # DB olmadan test (saxta data)
+
+İstəyə bağlı: sobe_mapping.csv  (ayırıcı ;  sütunlar: menbe_ad;sobe)
+    Depo / servis adını istədiyiniz şöbə adına yönləndirir.
+
+Reyestrin qrain-i:  Müraciət ayı x Şöbə x Xəstə (HK_ID)
+"""
+import os, re, sys, argparse, warnings
+from datetime import date, timedelta
+import pandas as pd
+
+warnings.filterwarnings("ignore")
+
+# ================== CONFIG ==================
+DB_USER = "NURAN"
+DB_PASS = "Nuran..2024!!"
+DB_DSN  = "172.18.79.23:1521/FONETAZ"
+INSTANT_CLIENT_DIR = r"C:\oracle\instantclient\instantclient_23_26"
+
+# ================== DƏRMAN DÜSTURU ==================
+# Sistemlə uzlaşdırma zamanı YALNIZ bu üç sətri dəyişmək kifayətdir.
+DERMAN_SATIS_EXPR = "NVL(T.SNLTUTAR, 0)"
+DERMAN_ALIS_EXPR  = "NVL(T.SNLALISTUTAR, 0)"
+DERMAN_WHERE      = "T.FORMTYPE = 2"            # Reyestr (dəyişməyib)
+DERMAN_AY_WHERE   = "T.FORMTYPE IN (2, 3, 10)"  # Şöbə icmalı: sistem hesabatı ilə eyni filtr
+
+# ============================================================================
+#  SQL
+#  :d1 / :d2  = müraciət ayı aralığı [d1, d2)
+#  :d3        = hesabat tarixi (exclusive) — bu tarixə qədər olan əməliyyatlar
+# ============================================================================
+COHORT = "h.HK_MURACAATTAR >= :d1 AND h.HK_MURACAATTAR < :d2 AND h.Hk_Durum = '+'"
+
+SQL_XIDMET = f"""
+SELECT T.HK_ID,
+       T.SR_ADI AS SOBE_MENBE,
+       MIN(T.HI_TARIH) AS ILK_TARIX,
+       MAX(T.HI_TARIH) AS SON_TARIX,
+       SUM(NVL(T.HI_HTUTAR,0)) AS XID_XESTE,
+       SUM(NVL(T.HI_KTUTAR,0)) AS XID_TESK
+FROM fonethbys.V_IST_GENEL_HIZMET T
+JOIN FONETHBYS.H_HASTAKAYIT h ON h.HK_ID = T.HK_ID
+WHERE {COHORT} AND T.HI_TARIH < :d3
+GROUP BY T.HK_ID, T.SR_ADI
+"""
+
+SQL_DERMAN = f"""
+SELECT T.HASTA_HKID AS HK_ID,
+       T.DEPOADI AS SOBE_MENBE,
+       SUM({DERMAN_SATIS_EXPR}) AS DERMAN_SATIS,
+       SUM({DERMAN_ALIS_EXPR})  AS DERMAN_ALIS
+FROM fonethbys.V_STOK_LIST_CIKISFISDETAY T
+JOIN FONETHBYS.H_HASTAKAYIT h ON h.HK_ID = T.HASTA_HKID
+WHERE {COHORT} AND {DERMAN_WHERE} AND T.TARIH < :d3
+GROUP BY T.HASTA_HKID, T.DEPOADI
+"""
+
+# Şöbə icmalı üçün: dərman İŞLƏNMƏ TARİXİNƏ (TARIH) görə, xəstənin müraciət tarixindən asılı olmayaraq
+SQL_DERMAN_AY = f"""
+SELECT T.DEPOADI AS SOBE_MENBE,
+       SUM({DERMAN_SATIS_EXPR}) AS DERMAN_SATIS,
+       SUM({DERMAN_ALIS_EXPR})  AS DERMAN_ALIS
+FROM fonethbys.V_STOK_LIST_CIKISFISDETAY T
+WHERE {DERMAN_AY_WHERE} AND T.TARIH >= :d1 AND T.TARIH < :d2 AND T.TARIH < :d3
+GROUP BY T.DEPOADI
+"""
+
+# HAKEDISTURU: 1 = Yapan hakedişi, 2 = Göndərən hakedişi
+SQL_HAKEDIS = f"""
+SELECT t.HK_ID,
+       t.SR_ADI AS SOBE_MENBE,
+       SUM(CASE WHEN TO_CHAR(t.HAKEDISTURU) = '1' THEN NVL(t.HAKTUTAR,0) ELSE 0 END) AS HK_YAPAN,
+       SUM(CASE WHEN TO_CHAR(t.HAKEDISTURU) = '2' THEN NVL(t.HAKTUTAR,0) ELSE 0 END) AS HK_GONDEREN
+FROM fonethbys.V_HAKEDIS_RAPOR t
+JOIN FONETHBYS.H_HASTAKAYIT h ON h.HK_ID = t.HK_ID
+WHERE {COHORT} AND t.HI_TARIH < :d3
+GROUP BY t.HK_ID, t.SR_ADI
+"""
+
+# Yatan xəstələr: yatış / nəql tarixi (H_YHNAKIL), şöbə = GELIS_SERVISID
+SQL_YATIS = f"""
+SELECT n.HKID AS HK_ID,
+       w.SR_ADI AS SOBE_MENBE,
+       MIN(n.GELIS_TARIH) AS YATIS_TARIXI,
+       MAX(n.NAKIL_TARIH) AS NEQL_TARIXI
+FROM FONETHBYS.H_YHNAKIL n
+JOIN FONETHBYS.H_HASTAKAYIT h ON h.HK_ID = n.HKID
+LEFT JOIN FONETHBYSADM.H_SERVIS w ON w.SR_ID = n.GELIS_SERVISID
+WHERE {COHORT}
+GROUP BY n.HKID, w.SR_ADI
+"""
+
+
+def _to_end(col):
+    return f"{col} < :d3"
+
+
+# --- borc hesabatındakı alt-sorğuların eyni məntiqi (kumulyativ, :d3-ə qədər) ---
+def _avans(c):
+    return ("(SELECT SUM(v.TUTAR) FROM FONETHBYSADM.VZN_GIRISLER_DETAY v "
+            "JOIN FONETHBYSADM.VZN_GIRISLER v1 ON v.FISID = v1.ID "
+            f"WHERE v1.HK_ID = t.HK_ID AND {c('v1.TARIH')})")
+
+
+def _negd(c):
+    return ("(SELECT SUM(h.TUTAR) FROM FONETHBYSADM.VZN_TAHSILAT h1 "
+            "JOIN FONETHBYSADM.VZN_TAHSILAT_ALT h ON h.FIS_ID = h1.ID "
+            "WHERE h1.HKID = t.HK_ID AND COALESCE(h.IADEDURUM, 'H') = 'H' "
+            "AND NOT EXISTS (SELECT 1 FROM FONETHBYSADM.VZN_AVANSHARCAMA h2 "
+            "WHERE h2.TAHSILAT_ID = h1.ID AND h2.TAHSILAT_ID IS NOT NULL) "
+            f"AND {c('h1.TARIH')})")
+
+
+def _xid(c):
+    return ("(SELECT SUM(j.HI_MIKTAR * CASE WHEN j.HI_ODTURU = 'Sigortalı' THEN j.HI_KFIYAT ELSE j.HI_HFIYAT END) "
+            f"FROM FONETHBYS.H_HASTAKAYIT_ALT j WHERE j.HI_KAYITID = t.HK_ID AND {c('j.HI_TARIH')})")
+
+
+def _derman(c):
+    return ("(SELECT ROUND(SUM(y.MIKTAR * y.FIYAT), 2) FROM FONETHBYS.STOK_CIKISDETAY y "
+            f"WHERE y.HASTA_HKID = t.HK_ID AND {c('y.TARIH')})")
+
+
+def _avansdan(c):
+    return ("(SELECT SUM(a.TUTAR) FROM FONETHBYSADM.VZN_AVANSHARCAMA a "
+            f"WHERE a.HK_ID = t.HK_ID AND {c('a.ETAR')})")
+
+
+def _qayt(c):
+    return ("(SELECT SUM(yy.ODENEN_TUTAR) FROM FONETHBYSADM.VZN_ODEMELER_DETAY yy "
+            f"WHERE yy.ilgi_fisid = t.HK_ID AND yy.ODEME_TURU = 41 AND {c('yy.TARIH')})")
+
+
+def build_patient_sql():
+    z = lambda s: f"COALESCE({s}, 0)"
+    return f"""
+SELECT t.HK_ID,
+       t.hk_kodu AS KOD,
+       t.hk_hastaturu AS HASTA_TURU,
+       t.hk_HSINIFID AS HSINIF,
+       t.HK_MURACAATTAR AS MURACIET,
+       t.HK_CIKISTARIHI AS CIXIS,
+       {z(_avans(_to_end))}      AS AVANS_K,
+       {z(_negd(_to_end))}       AS NEGD_K,
+       {z(_xid(_to_end))}        AS XID_K,
+       {z(_derman(_to_end))}     AS DERMAN_K,
+       {z(_avansdan(_to_end))}   AS AVANSDAN_K,
+       {z(_qayt(_to_end))}       AS QAYT_K
+FROM FONETHBYS.H_HASTAKAYIT t
+WHERE t.Hk_Durum = '+'
+  AND t.HK_MURACAATTAR >= :d1 AND t.HK_MURACAATTAR < :d2
+"""
+
+
+# ============================================================================
+#  ŞÖBƏ ADLARININ BİRLƏŞDİRİLMƏSİ (servis adı / depo adı -> şöbə)
+# ============================================================================
+SUFFIX_RE = re.compile(r"\s+(teserrufat|təsərrüfat|tes\.?)\s*$", re.I)
+SOBE_WORD_RE = re.compile(r"\s+(şöbəsi|şöbə|sobesi|sobe)\s*$", re.I)
+NOT_SOBE_KEYWORDS = ("envanter", "cihaz", "deposit")
+NOT_SOBE_LABEL = "Depo (şöbəyə aid deyil)"
+
+
+def _key(name):
+    n = str(name).strip()
+    n = SUFFIX_RE.sub("", n)
+    n = SOBE_WORD_RE.sub("", n)
+    return n.casefold()
+
+
+class SobeMapper:
+    def __init__(self, manual=None):
+        self.manual = manual or {}
+        self.display = {}     # key -> göstərilən ad
+        self.log = {}         # (menbe_ad, növ) -> (şöbə, üsul)
+
+    def learn(self, names):
+        """Servis adları (təsərrüfat/depo olmayan) göstərilən ad kimi üstünlük alır."""
+        for n in names:
+            if pd.isna(n):
+                continue
+            n = str(n).strip()
+            if SUFFIX_RE.search(n):
+                continue
+            self.display.setdefault(_key(n), n)
+
+    def map(self, name, kind):
+        if pd.isna(name) or str(name).strip() == "":
+            res, how = "Təyin olunmayıb", "boş"
+        else:
+            n = str(name).strip()
+            if n in self.manual:
+                res, how = self.manual[n], "əl ilə"
+            elif any(k in n.casefold() for k in NOT_SOBE_KEYWORDS):
+                res, how = NOT_SOBE_LABEL, "avtomatik"
+            else:
+                k = _key(n)
+                res, how = self.display.get(k, SUFFIX_RE.sub("", n).strip()), "avtomatik"
+        self.log[(str(name), kind)] = (res, how)
+        return res
+
+
+def load_mapping(path):
+    if path and os.path.exists(path):
+        df = pd.read_csv(path, sep=";", dtype=str, encoding="utf-8-sig")
+        return dict(zip(df["menbe_ad"].str.strip(), df["sobe"].str.strip()))
+    return {}
+
+
+# ============================================================================
+#  REYESTRİN QURULMASI
+# ============================================================================
+NUM_COLS = ["XID_XESTE", "XID_TESK", "DERMAN_SATIS", "DERMAN_ALIS",
+            "HK_YAPAN", "HK_GONDEREN", "AVANS", "NEGD", "QAYT"]
+
+
+def build_registry(label, xid, der, hak, yat, pat, mapper, asof):
+    mapper.learn(list(xid["SOBE_MENBE"]) + list(hak["SOBE_MENBE"]) + list(der["SOBE_MENBE"]) + list(yat["SOBE_MENBE"]))
+    xid = xid.copy(); der = der.copy(); hak = hak.copy(); yat = yat.copy()
+    xid["SOBE"] = [mapper.map(n, "Xidmət") for n in xid["SOBE_MENBE"]]
+    der["SOBE"] = [mapper.map(n, "Depo") for n in der["SOBE_MENBE"]]
+    hak["SOBE"] = [mapper.map(n, "Hakediş") for n in hak["SOBE_MENBE"]]
+    yat["SOBE"] = [mapper.map(n, "Yatış") for n in yat["SOBE_MENBE"]]
+
+    keys = ["HK_ID", "SOBE"]
+    xg = xid.groupby(keys, as_index=False).agg(
+        ILK=("ILK_TARIX", "min"), SON=("SON_TARIX", "max"),
+        XID_XESTE=("XID_XESTE", "sum"), XID_TESK=("XID_TESK", "sum"))
+    dg = der.groupby(keys, as_index=False).agg(DERMAN_SATIS=("DERMAN_SATIS", "sum"), DERMAN_ALIS=("DERMAN_ALIS", "sum"))
+    hg = hak.groupby(keys, as_index=False).agg(HK_YAPAN=("HK_YAPAN", "sum"), HK_GONDEREN=("HK_GONDEREN", "sum"))
+    yg = yat.groupby(keys, as_index=False).agg(YATIS=("YATIS_TARIXI", "min"), NEQL=("NEQL_TARIXI", "max"))
+
+    reg = xg.merge(dg, on=keys, how="outer").merge(hg, on=keys, how="outer").merge(yg, on=keys, how="left")
+    for c in ["ILK", "SON", "YATIS", "NEQL"]:
+        if c not in reg: reg[c] = pd.NaT
+        reg[c] = pd.to_datetime(reg[c])
+    for c in ["XID_XESTE", "XID_TESK", "DERMAN_SATIS", "DERMAN_ALIS", "HK_YAPAN", "HK_GONDEREN"]:
+        reg[c] = reg[c].fillna(0)
+
+    # ödənişlərin (kumulyativ) şöbələr arasında mütənasib bölüşdürülməsi
+    reg["_H"] = reg[["XID_XESTE", "XID_TESK", "DERMAN_SATIS"]].sum(axis=1)
+    tot = reg.groupby("HK_ID")["_H"].transform("sum")
+    cnt = reg.groupby("HK_ID")["_H"].transform("size")
+    reg["_share"] = (reg["_H"] / tot).where(tot != 0, 1.0 / cnt)
+
+    pay = pat[["HK_ID", "AVANS_K", "NEGD_K", "QAYT_K"]].rename(
+        columns={"AVANS_K": "AVANS", "NEGD_K": "NEGD", "QAYT_K": "QAYT"})
+    reg = reg.merge(pay, on="HK_ID", how="left")
+    for c in ["AVANS", "NEGD", "QAYT"]:
+        reg[c] = reg[c].fillna(0) * reg["_share"]
+
+    # ödənişi olub, heç bir xidmət/dərmanı olmayan xəstələr
+    orphan = pay[~pay["HK_ID"].isin(reg["HK_ID"])]
+    orphan = orphan[(orphan[["AVANS", "NEGD", "QAYT"]].abs().sum(axis=1)) > 0].copy()
+    if len(orphan):
+        orphan["SOBE"] = "Bölüşdürülməyib"
+        reg = pd.concat([reg, orphan], ignore_index=True)
+    reg = reg.drop(columns=["_H", "_share"])
+    for c in NUM_COLS:
+        reg[c] = reg[c].fillna(0)
+
+    # xəstə atributları
+    attr = pat[["HK_ID", "KOD", "HASTA_TURU", "HSINIF", "MURACIET", "CIXIS"]].drop_duplicates("HK_ID")
+    reg = reg.merge(attr, on="HK_ID", how="left")
+    reg["KOD"] = reg["KOD"].fillna(reg["HK_ID"].map(lambda x: f"ID{int(x)}"))
+    reg["HASTA_TURU"] = reg["HASTA_TURU"].fillna("")
+    reg["STATUS"] = reg["HSINIF"].map({1: "Ödənişli", 2: "Sığortalı"}).fillna(
+        reg["HSINIF"].map(lambda v: "" if pd.isna(v) else "Digər"))
+    for c in ["MURACIET", "CIXIS"]:
+        reg[c] = pd.to_datetime(reg[c])
+    reg.insert(0, "AY", label)
+
+    # yatış günü: (nəql tarixi, yoxsa çıxış tarixi, yoxsa hesabat tarixi) − yatış tarixi; minimum 1; ambulatorda boş
+    end = reg["NEQL"].fillna(reg["CIXIS"]).fillna(pd.Timestamp(asof))
+    gun = (end.dt.normalize() - reg["YATIS"].dt.normalize()).dt.days
+    reg["YATIS_GUN"] = gun.clip(lower=1).where(reg["YATIS"].notna())
+
+    # hesablanan sütunlar (Excel-də formul kimi yazılır, burada nəzarət üçün)
+    reg["XID_CEMI"] = reg["XID_XESTE"] + reg["XID_TESK"]
+    reg["HESABLANMIS"] = reg["XID_CEMI"] + reg["DERMAN_SATIS"]
+    reg["ODENILMIS"] = reg["AVANS"] + reg["NEGD"] - reg["QAYT"]
+    reg["QALIQ"] = reg["HESABLANMIS"] - reg["ODENILMIS"]
+    reg["HK_CEMI"] = reg["HK_YAPAN"] + reg["HK_GONDEREN"]
+    reg["DOVRIYYE"] = reg["HESABLANMIS"] - reg["DERMAN_ALIS"] - reg["HK_CEMI"]
+    reg = reg.sort_values(["SOBE", "KOD"]).reset_index(drop=True)
+    # unikal xəstə sayı üçün: hər HK_ID-nin ilk sətri = 1 (distinct HK_ID)
+    reg["UNIKAL"] = (~reg.duplicated("HK_ID")).astype(int)
+    return reg
+
+
+def build_derman_ay(label, df, mapper):
+    """Şöbə icmalı üçün: dərman işlənmə tarixinə görə (depo -> şöbə)."""
+    cols = ["AY", "SOBE", "DERMAN_SATIS", "DERMAN_ALIS"]
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+    df = df.copy()
+    df["SOBE"] = [mapper.map(n, "Depo") for n in df["SOBE_MENBE"]]
+    g = df.groupby("SOBE", as_index=False).agg(DERMAN_SATIS=("DERMAN_SATIS", "sum"), DERMAN_ALIS=("DERMAN_ALIS", "sum"))
+    g.insert(0, "AY", label)
+    return g[cols]
+
+
+def build_patient_sheet(label, pat):
+    p = pat.copy()
+    p.insert(0, "AY", label)
+    p["STATUS"] = p["HSINIF"].map({1: "Ödənişli", 2: "Sığortalı"}).fillna("Digər")
+    p["BORC_K"] = p["AVANS_K"] + p["NEGD_K"] - (p["XID_K"] + p["DERMAN_K"] + p["QAYT_K"])
+    # yalnız əməliyyatı və ya ödənişi olan xəstələr
+    act = p[["AVANS_K", "NEGD_K", "XID_K", "DERMAN_K", "QAYT_K"]].abs().sum(axis=1) > 0
+    return p[act].reset_index(drop=True)
+
+
+# ============================================================================
+#  EXCEL
+# ============================================================================
+REG_COLS = [  # (df sütunu, başlıq, tip, en)
+    ("AY", "Müraciət ayı", "t", 10), ("SOBE", "Şöbə", "t", 30), ("KOD", "Xəstə kodu", "t", 14),
+    ("HASTA_TURU", "Xəstə növü", "t", 12), ("STATUS", "Xəstə statusu", "t", 12),
+    ("MURACIET", "Müraciət tarixi", "d", 12), ("CIXIS", "Çıxış tarixi", "d", 12),
+    ("YATIS", "Yatış tarixi", "d", 12), ("NEQL", "Nəql tarixi", "d", 12),
+    ("ILK", "İlk xidmət tarixi", "d", 12), ("SON", "Son xidmət tarixi", "d", 12), ("YATIS_GUN", "Yatış günü", "i", 9),
+    ("XID_XESTE", "Xidmət – xəstə məbləği", "m", 14), ("XID_TESK", "Xidmət – təşkilat məbləği", "m", 14),
+    ("XID_CEMI", "Xidmət cəmi", "f", 13),
+    ("DERMAN_SATIS", "Dərman (satış)", "m", 13), ("HESABLANMIS", "Cəmi hesablanmış", "f", 14),
+    ("AVANS", "Avans", "m", 12), ("NEGD", "Nağd", "m", 12), ("QAYT", "Avans qaytarma", "m", 13),
+    ("ODENILMIS", "Ödənilmiş (pay)", "f", 13), ("QALIQ", "Qalıq borc", "f", 13),
+    ("DERMAN_ALIS", "Dərman alış (maya)", "m", 13),
+    ("HK_YAPAN", "Həkim qazancı (icra)", "m", 14), ("HK_GONDEREN", "Həkim qazancı (göndərən)", "m", 14),
+    ("HK_CEMI", "Həkim qazancı cəmi", "f", 14), ("DOVRIYYE", "Dövriyyə (xalis)", "f", 14),
+    ("UNIKAL", "Xəstə (unikal, HK_ID)", "i", 12),
+]
+FORMULAS = {  # sətir nömrəsi {r} ilə
+    "XID_CEMI": "={XID_XESTE}{r}+{XID_TESK}{r}",
+    "HESABLANMIS": "={XID_CEMI}{r}+{DERMAN_SATIS}{r}",
+    "ODENILMIS": "={AVANS}{r}+{NEGD}{r}-{QAYT}{r}",
+    "QALIQ": "={HESABLANMIS}{r}-{ODENILMIS}{r}",
+    "HK_CEMI": "={HK_YAPAN}{r}+{HK_GONDEREN}{r}",
+    "DOVRIYYE": "={HESABLANMIS}{r}-{DERMAN_ALIS}{r}-{HK_CEMI}{r}",
+}
+
+
+# ============================================================================
+#  RƏHBƏRLİK İCMALI (idarəetmə üçün təqdimat vərəqi)
+# ============================================================================
+def write_exec_sheet(wb, ws, F, R, DR, reg, derm, src_ay, aylar, asof):
+    SN = "Rəhbərlik icmalı"
+    ALL = "Hamısı"
+    NAVY, BLUE, LIGHT = "#1F3864", "#2F5597", "#EEF2F8"
+    NOT_DEPT = {"Bölüşdürülməyib", NOT_SOBE_LABEL, "Təyin olunmayıb"}
+    asof = asof or date.today()
+    HELP = "$N$3"
+
+    # ---------- formatlar ----------
+    f_title = F(bold=True, font_size=18, font_color="#FFFFFF", bg_color=NAVY, valign="vcenter", indent=1)
+    f_sub = F(font_size=10, font_color="#FFFFFF", bg_color=BLUE, valign="vcenter", indent=1)
+    f_sel_l = F(bold=True, align="right", valign="vcenter")
+    f_sel = F(bold=True, border=2, border_color=BLUE, bg_color="#FFF2CC", align="center", valign="vcenter")
+    f_hint = F(italic=True, font_color="#7F7F7F", font_size=9, valign="vcenter", indent=1)
+    t_lab = F(font_size=9, bold=True, font_color="#595959", bg_color=LIGHT, align="center", valign="vcenter", top=5, top_color=BLUE)
+    t_int = F(font_size=18, bold=True, font_color=NAVY, bg_color=LIGHT, align="center", valign="vcenter", num_format="#,##0")
+    t_pct = F(font_size=18, bold=True, font_color=NAVY, bg_color=LIGHT, align="center", valign="vcenter", num_format="0.0%")
+    sect = F(bold=True, font_size=11, font_color="#FFFFFF", bg_color=BLUE, valign="vcenter", indent=1)
+    th = F(bold=True, font_color="#FFFFFF", bg_color=NAVY, align="center", valign="vcenter", text_wrap=True, border=1, border_color="#BFBFBF")
+    bc = "#D9D9D9"
+    td_t = F(border=1, border_color=bc, valign="vcenter")
+    td_c = F(border=1, border_color=bc, align="center", valign="vcenter")
+    td_n = F(border=1, border_color=bc, num_format="#,##0;[Red]-#,##0", valign="vcenter")
+    td_p = F(border=1, border_color=bc, num_format="0.0%;[Red]-0.0%", valign="vcenter")
+    tt_t = F(bold=True, bg_color="#D9E1F2", border=1, border_color="#BFBFBF")
+    tt_n = F(bold=True, bg_color="#D9E1F2", border=1, border_color="#BFBFBF", num_format="#,##0;[Red]-#,##0")
+    tt_p = F(bold=True, bg_color="#D9E1F2", border=1, border_color="#BFBFBF", num_format="0.0%;[Red]-0.0%")
+    ot_t = F(italic=True, border=1, border_color=bc, font_color="#595959")
+    ot_n = F(italic=True, border=1, border_color=bc, font_color="#595959", num_format="#,##0;[Red]-#,##0")
+    ot_p = F(italic=True, border=1, border_color=bc, font_color="#595959", num_format="0.0%;[Red]-0.0%")
+    f_ins = F(font_size=10, text_wrap=True, valign="vcenter", indent=1, bg_color="#F7F9FC", border=1, border_color=bc)
+    f_note = F(font_size=9, font_color="#404040", text_wrap=True, valign="top", indent=1)
+
+    # ---------- keş dəyərləri (Excel açılanda formullar yenidən hesablanır) ----------
+    def agg(rg, dg):
+        xid = float(rg["XID_CEMI"].sum()); ds = float(dg["DERMAN_SATIS"].sum()); da = float(dg["DERMAN_ALIS"].sum())
+        hk = float(rg["HK_CEMI"].sum()); od = float(rg["ODENILMIS"].sum()); hes = xid + ds
+        return dict(pat=int(rg["UNIKAL"].sum()), rows=len(rg), xid=xid, ds=ds, hes=hes, da=da, hk=hk, od=od,
+                    dov=hes - da - hk, qal=hes - od)
+    sf = lambda a, b: a / b if b else 0.0
+    T = agg(reg, derm)
+    mon = {m: agg(reg[reg["AY"] == m], derm[derm["AY"] == m]) for m in aylar}
+    deps = sorted((set(reg["SOBE"]) | set(derm["SOBE"])) - NOT_DEPT)
+    dv = {s: agg(reg[reg["SOBE"] == s], derm[derm["SOBE"] == s]) for s in deps}
+    deps.sort(key=lambda s: -dv[s]["dov"])
+    nd, nm = len(deps), len(aylar)
+
+    # ---------- yerləşmə ----------
+    r_mbar, r_mhead = 10, 11
+    r_m0 = 12; r_mtot = r_m0 + nm
+    r_cbar = r_mtot + 2; r_chart = r_cbar + 1
+    r_kbar = r_chart + 17
+    r_k0 = r_kbar + 1
+    r_dbar = r_k0 + 17
+    r_dhead = r_dbar + 1; r_d0 = r_dhead + 1; r_d1 = r_d0 + nd - 1
+    r_dother = r_d0 + nd; r_dtot = r_dother + 1
+    r_nbar = r_dtot + 2
+
+    ws.hide_gridlines(2)
+    ws.set_column(0, 11, 13)
+    ws.set_column(13, 13, 10, None, {"hidden": True})
+    ws.set_tab_color(NAVY)
+
+    # ---------- başlıq ----------
+    ws.set_row(0, 38); ws.set_row(1, 20); ws.set_row(2, 26)
+    ws.merge_range(0, 0, 0, 11, "BABƏK FİLİALI — ŞÖBƏLƏR ÜZRƏ MALİYYƏ PERFORMANS HESABATI", f_title)
+    ws.merge_range(1, 0, 1, 11, f"Məlumat tarixi: {asof:%d.%m.%Y}     |     Məbləğlər AZN ilə     |     "
+                                f"Xəstələr müraciət ayına görə qruplaşdırılıb", f_sub)
+    ws.merge_range(2, 0, 2, 1, "Hesabat ayı (seçin):", f_sel_l)
+    ws.write(2, 2, ALL, f_sel)
+    ws.data_validation(2, 2, 2, 2, {"validate": "list", "source": src_ay})
+    ws.merge_range(2, 3, 2, 11, "Ayı dəyişdikdə göstəricilər, tərkib qrafiki və şöbə cədvəli yenilənir. Aylıq dinamika həmişə bütün ayları göstərir.", f_hint)
+    ws.write_formula(2, 13, '=IF($C$3="Hamısı","*",$C$3)', None, "*")
+
+    # ---------- KPI kartları ----------
+    kcols = ["A", "C", "E", "G", "I", "K"]
+    row1 = [("XƏSTƏ SAYI", f'=SUMIFS({R("UNIKAL")},{R("AY")},{HELP})', T["pat"], t_int),
+            ("XİDMƏT CƏMİ", f'=SUMIFS({R("XID_CEMI")},{R("AY")},{HELP})', T["xid"], t_int),
+            ("DƏRMAN SATIŞI", f'=SUMIFS({DR("C")},{DR("A")},{HELP})', T["ds"], t_int),
+            ("CƏMİ HESABLANMIŞ", "=C6+E6", T["hes"], t_int),
+            ("DƏRMAN ALIŞ (MAYA)", f'=SUMIFS({DR("D")},{DR("A")},{HELP})', T["da"], t_int),
+            ("HƏKİM QAZANCI", f'=SUMIFS({R("HK_CEMI")},{R("AY")},{HELP})', T["hk"], t_int)]
+    row2 = [("DÖVRİYYƏ (XALİS)", "=G6-I6-K6", T["dov"], t_int),
+            ("DÖVRİYYƏ MARJASI", "=IFERROR(A9/G6,0)", sf(T["dov"], T["hes"]), t_pct),
+            ("ÖDƏNİLMİŞ MƏBLƏĞ", f'=SUMIFS({R("ODENILMIS")},{R("AY")},{HELP})', T["od"], t_int),
+            ("QALIQ BORC", "=G6-E9", T["qal"], t_int),
+            ("XƏSTƏ BAŞINA ORTA", "=IFERROR(G6/A6,0)", sf(T["hes"], T["pat"]), t_int),
+            ("HƏKİM PAYI", "=IFERROR(K6/G6,0)", sf(T["hk"], T["hes"]), t_pct)]
+    for (rl, rv), tiles in (((4, 5), row1), ((7, 8), row2)):
+        ws.set_row(rl, 20); ws.set_row(rv, 38)
+        for k, (lab, fml, val, fmt) in enumerate(tiles):
+            c = 2 * k
+            ws.merge_range(rl, c, rl, c + 1, lab, t_lab)
+            ws.merge_range(rv, c, rv, c + 1, "", fmt)
+            ws.write_formula(rv, c, fml, fmt, val)
+    ws.set_row(6, 8)
+
+    # ---------- aylıq dinamika ----------
+    ws.set_row(r_mbar, 22)
+    ws.merge_range(r_mbar, 0, r_mbar, 11, "AYLIQ DİNAMİKA", sect)
+    heads = ["Ay", "Xəstə sayı", "Xidmət", "Dərman satış", "Cəmi hesablanmış", "Dərman alış", "Həkim qazancı",
+             "Dövriyyə (xalis)", "Marja", "Ödənilmiş", "Qalıq borc", "Xəstə başına orta"]
+    ws.set_row(r_mhead, 32)
+    for c, h in enumerate(heads): ws.write(r_mhead, c, h, th)
+    for i, m in enumerate(aylar):
+        r = r_m0 + i; x = r + 1; v = mon[m]
+        ws.write(r, 0, m, td_c)
+        ws.write_formula(r, 1, f'=SUMIFS({R("UNIKAL")},{R("AY")},$A{x})', td_n, v["pat"])
+        ws.write_formula(r, 2, f'=SUMIFS({R("XID_CEMI")},{R("AY")},$A{x})', td_n, v["xid"])
+        ws.write_formula(r, 3, f'=SUMIFS({DR("C")},{DR("A")},$A{x})', td_n, v["ds"])
+        ws.write_formula(r, 4, f"=C{x}+D{x}", td_n, v["hes"])
+        ws.write_formula(r, 5, f'=SUMIFS({DR("D")},{DR("A")},$A{x})', td_n, v["da"])
+        ws.write_formula(r, 6, f'=SUMIFS({R("HK_CEMI")},{R("AY")},$A{x})', td_n, v["hk"])
+        ws.write_formula(r, 7, f"=E{x}-F{x}-G{x}", td_n, v["dov"])
+        ws.write_formula(r, 8, f"=IFERROR(H{x}/E{x},0)", td_p, sf(v["dov"], v["hes"]))
+        ws.write_formula(r, 9, f'=SUMIFS({R("ODENILMIS")},{R("AY")},$A{x})', td_n, v["od"])
+        ws.write_formula(r, 10, f"=E{x}-J{x}", td_n, v["qal"])
+        ws.write_formula(r, 11, f"=IFERROR(E{x}/B{x},0)", td_n, sf(v["hes"], v["pat"]))
+    x = r_mtot + 1; a, b = r_m0 + 1, r_mtot
+    ws.write(r_mtot, 0, "CƏMİ", tt_t)
+    tv = dict(B=T["pat"], C=T["xid"], D=T["ds"], E=T["hes"], F=T["da"], G=T["hk"], H=T["dov"], J=T["od"], K=T["qal"])
+    for col, val in tv.items():
+        ci = ord(col) - 65
+        ws.write_formula(r_mtot, ci, f"=SUM({col}{a}:{col}{b})", tt_n, val)
+    ws.write_formula(r_mtot, 8, f"=IFERROR(H{x}/E{x},0)", tt_p, sf(T["dov"], T["hes"]))
+    ws.write_formula(r_mtot, 11, f"=IFERROR(E{x}/B{x},0)", tt_n, sf(T["hes"], T["pat"]))
+
+    # ---------- qrafiklər ----------
+    ws.set_row(r_cbar, 22)
+    ws.merge_range(r_cbar, 0, r_cbar, 11, "DİNAMİKA VƏ ŞÖBƏ REYTİNQİ", sect)
+    ch1 = wb.add_chart({"type": "column"})
+    ch1.add_series({"name": "Cəmi hesablanmış", "categories": [SN, r_m0, 0, r_mtot - 1, 0],
+                    "values": [SN, r_m0, 4, r_mtot - 1, 4], "fill": {"color": "#9DC3E6"}, "gap": 80})
+    ln = wb.add_chart({"type": "line"})
+    ln.add_series({"name": "Dövriyyə (xalis)", "categories": [SN, r_m0, 0, r_mtot - 1, 0],
+                   "values": [SN, r_m0, 7, r_mtot - 1, 7], "line": {"color": NAVY, "width": 2.5},
+                   "marker": {"type": "circle", "size": 6, "fill": {"color": NAVY}, "border": {"color": NAVY}}})
+    ch1.combine(ln)
+    ch1.set_title({"name": "Aylıq dinamika (AZN)", "name_font": {"name": "Arial", "size": 11, "bold": True}})
+    ch1.set_legend({"position": "bottom", "font": {"name": "Arial", "size": 9}})
+    ch1.set_y_axis({"num_format": "#,##0", "num_font": {"name": "Arial", "size": 8}, "major_gridlines": {"visible": True, "line": {"color": "#E0E0E0"}}})
+    ch1.set_x_axis({"num_font": {"name": "Arial", "size": 8}})
+    ch1.set_size({"width": 555, "height": 320})
+    ws.insert_chart(r_chart, 0, ch1, {"x_offset": 2, "y_offset": 6})
+    if nd:
+        n10 = min(10, nd)
+        ch2 = wb.add_chart({"type": "bar"})
+        ch2.add_series({"name": "Dövriyyə (xalis)", "categories": [SN, r_d0, 0, r_d0 + n10 - 1, 0],
+                        "values": [SN, r_d0, 7, r_d0 + n10 - 1, 7], "fill": {"color": BLUE}, "gap": 50,
+                        "data_labels": {"value": True, "num_format": "#,##0", "font": {"name": "Arial", "size": 8}}})
+        ch2.set_title({"name": f"Dövriyyə üzrə ilk {n10} şöbə (AZN)", "name_font": {"name": "Arial", "size": 11, "bold": True}})
+        ch2.set_legend({"none": True})
+        ch2.set_y_axis({"reverse": True, "num_font": {"name": "Arial", "size": 8}})
+        ch2.set_x_axis({"num_format": "#,##0", "num_font": {"name": "Arial", "size": 8}, "major_gridlines": {"visible": True, "line": {"color": "#E0E0E0"}}})
+        ch2.set_size({"width": 555, "height": 320})
+        ws.insert_chart(r_chart, 6, ch2, {"x_offset": 8, "y_offset": 6})
+
+    # ---------- gəlir tərkibi + müşahidələr ----------
+    ws.set_row(r_kbar, 22)
+    ws.merge_range(r_kbar, 0, r_kbar, 11, "GƏLİR TƏRKİBİ VƏ ƏSAS MÜŞAHİDƏLƏR", sect)
+    c0 = r_k0
+    ws.merge_range(c0, 0, c0, 2, "Gəlir tərkibi", th); ws.write(c0, 3, "Məbləğ", th); ws.write(c0, 4, "Pay", th)
+    comp = [("Xidmət – xəstə məbləği", f'=SUMIFS({R("XID_XESTE")},{R("AY")},{HELP})', float(reg["XID_XESTE"].sum())),
+            ("Xidmət – təşkilat məbləği", f'=SUMIFS({R("XID_TESK")},{R("AY")},{HELP})', float(reg["XID_TESK"].sum())),
+            ("Dərman satışı", "=E6", T["ds"])]
+    ctot = sum(v for *_a, v in comp); xt = c0 + 5
+    for i, (lab, fml, val) in enumerate(comp):
+        r = c0 + 1 + i
+        ws.merge_range(r, 0, r, 2, lab, td_t)
+        ws.write_formula(r, 3, fml, td_n, val)
+        ws.write_formula(r, 4, f"=IFERROR(D{r+1}/D${xt-0},0)", td_p, sf(val, ctot))
+    ws.merge_range(c0 + 4, 0, c0 + 4, 2, "Cəmi", tt_t)
+    ws.write_formula(c0 + 4, 3, f"=SUM(D{c0+2}:D{c0+4})", tt_n, ctot)
+    ws.write_formula(c0 + 4, 4, f"=IFERROR(D{c0+5}/D{c0+5},0)", tt_p, 1.0 if ctot else 0.0)
+    for i in range(3):   # pay formulunun məxrəci: cəmi sətri
+        r = c0 + 1 + i
+        ws.write_formula(r, 4, f"=IFERROR(D{r+1}/D${c0+5},0)", td_p, sf(comp[i][2], ctot))
+    ch3 = wb.add_chart({"type": "doughnut"})
+    ch3.add_series({"name": "Gəlir tərkibi", "categories": [SN, c0 + 1, 0, c0 + 3, 0], "values": [SN, c0 + 1, 3, c0 + 3, 3],
+                    "data_labels": {"percentage": True, "font": {"name": "Arial", "size": 9, "bold": True, "color": "#FFFFFF"}},
+                    "points": [{"fill": {"color": NAVY}}, {"fill": {"color": "#5B9BD5"}}, {"fill": {"color": "#ED7D31"}}]})
+    ch3.set_hole_size(50)
+    ch3.set_title({"name": "Gəlir tərkibi", "name_font": {"name": "Arial", "size": 11, "bold": True}})
+    ch3.set_legend({"position": "right", "font": {"name": "Arial", "size": 9}})
+    ch3.set_size({"width": 555, "height": 300})
+    ws.insert_chart(c0, 6, ch3, {"x_offset": 8, "y_offset": 2})
+    ws.merge_range(c0 + 6, 0, c0 + 6, 5, "Əsas müşahidələr", th)
+    if nd:
+        d0x, d1x = r_d0 + 1, r_d1 + 1
+        rngH, rngA, rngD = f"$H${d0x}:$H${d1x}", f"$A${d0x}:$A${d1x}", f"$D${d0x}:$D${d1x}"
+        topd = deps[0]; topn = max(deps, key=lambda s: dv[s]["rows"])
+        ins = [(f'="Ən yüksək dövriyyə: "&INDEX({rngA},MATCH(MAX({rngH}),{rngH},0))&" — "&TEXT(MAX({rngH}),"#,##0")&" AZN"',
+                f"Ən yüksək dövriyyə: {topd} — {dv[topd]['dov']:,.0f} AZN"),
+               (f'="Ən çox xəstə: "&INDEX({rngA},MATCH(MAX({rngD}),{rngD},0))&" — "&TEXT(MAX({rngD}),"#,##0")&" xəstə"',
+                f"Ən çox xəstə: {topn} — {dv[topn]['rows']:,.0f} xəstə"),
+               ('="Ümumi marja "&TEXT($C$9,"0.0%")&"; həkim payı "&TEXT($K$9,"0.0%")&"; qalıq borc "&TEXT($G$9,"#,##0")&" AZN"',
+                f"Ümumi marja {sf(T['dov'], T['hes']):.1%}; həkim payı {sf(T['hk'], T['hes']):.1%}; qalıq borc {T['qal']:,.0f} AZN")]
+        for i, (fml, val) in enumerate(ins):
+            r = c0 + 7 + i
+            ws.set_row(r, 30)
+            ws.merge_range(r, 0, r, 5, "", f_ins)
+            ws.write_formula(r, 0, fml, f_ins, val)
+
+    # ---------- şöbələr üzrə cədvəl ----------
+    ws.set_row(r_dbar, 22)
+    ws.merge_range(r_dbar, 0, r_dbar, 11, "ŞÖBƏLƏR ÜZRƏ NƏTİCƏ (dövriyyəyə görə sıralanıb)", sect)
+    ws.set_row(r_dhead, 32)
+    ws.merge_range(r_dhead, 0, r_dhead, 2, "Şöbə", th)
+    for c, h in enumerate(["Xəstə sayı", "Cəmi hesablanmış", "Dərman alış", "Həkim qazancı", "Dövriyyə (xalis)",
+                           "Marja", "Dövriyyədə pay", "Ödənilmiş", "Qalıq borc"], start=3):
+        ws.write(r_dhead, c, h, th)
+    tx = r_dtot + 1
+    for i, s in enumerate(deps):
+        r = r_d0 + i; x = r + 1; v = dv[s]
+        ws.merge_range(r, 0, r, 2, s, td_t)
+        ws.write_formula(r, 3, f'=COUNTIFS({R("SOBE")},$A{x},{R("AY")},{HELP})', td_n, v["rows"])
+        ws.write_formula(r, 4, f'=SUMIFS({R("XID_CEMI")},{R("SOBE")},$A{x},{R("AY")},{HELP})+SUMIFS({DR("C")},{DR("B")},$A{x},{DR("A")},{HELP})', td_n, v["hes"])
+        ws.write_formula(r, 5, f'=SUMIFS({DR("D")},{DR("B")},$A{x},{DR("A")},{HELP})', td_n, v["da"])
+        ws.write_formula(r, 6, f'=SUMIFS({R("HK_CEMI")},{R("SOBE")},$A{x},{R("AY")},{HELP})', td_n, v["hk"])
+        ws.write_formula(r, 7, f"=E{x}-F{x}-G{x}", td_n, v["dov"])
+        ws.write_formula(r, 8, f"=IFERROR(H{x}/E{x},0)", td_p, sf(v["dov"], v["hes"]))
+        ws.write_formula(r, 9, f"=IFERROR(H{x}/$H${tx},0)", td_p, sf(v["dov"], T["dov"]))
+        ws.write_formula(r, 10, f'=SUMIFS({R("ODENILMIS")},{R("SOBE")},$A{x},{R("AY")},{HELP})', td_n, v["od"])
+        ws.write_formula(r, 11, f"=E{x}-K{x}", td_n, v["qal"])
+    # "Digər" sətri: cəmi − şöbələrin cəmi
+    xo = r_dother + 1
+    sums = {k: sum(dv[s][k] for s in deps) for k in ("hes", "da", "hk", "dov", "od", "qal")}
+    oth = {k: T[k] - sums[k] for k in sums}
+    ws.merge_range(r_dother, 0, r_dother, 2, "Digər (depo / bölüşdürülməyən)", ot_t)
+    ws.write_blank(r_dother, 3, None, ot_n)
+    for col, key in (("E", "hes"), ("F", "da"), ("G", "hk"), ("K", "od")):
+        ci = ord(col) - 65
+        rng = f"{col}{r_d0+1}:{col}{r_d1+1}" if nd else f"{col}1:{col}1"
+        ws.write_formula(r_dother, ci, f"={col}{tx}-SUM({rng})" if nd else f"={col}{tx}", ot_n, oth[key])
+    ws.write_formula(r_dother, 7, f"=E{xo}-F{xo}-G{xo}", ot_n, oth["dov"])
+    ws.write_formula(r_dother, 8, f"=IFERROR(H{xo}/E{xo},0)", ot_p, sf(oth["dov"], oth["hes"]))
+    ws.write_formula(r_dother, 9, f"=IFERROR(H{xo}/$H${tx},0)", ot_p, sf(oth["dov"], T["dov"]))
+    ws.write_formula(r_dother, 11, f"=E{xo}-K{xo}", ot_n, oth["qal"])
+    # CƏMİ (KPI kartlarına bərabərdir)
+    ws.merge_range(r_dtot, 0, r_dtot, 2, "CƏMİ", tt_t)
+    for ci, f_, val, fm in ((3, "=A6", T["pat"], tt_n), (4, "=G6", T["hes"], tt_n), (5, "=I6", T["da"], tt_n),
+                            (6, "=K6", T["hk"], tt_n), (7, "=A9", T["dov"], tt_n), (10, "=E9", T["od"], tt_n), (11, "=G9", T["qal"], tt_n)):
+        ws.write_formula(r_dtot, ci, f_, fm, val)
+    ws.write_formula(r_dtot, 8, f"=IFERROR(H{tx}/E{tx},0)", tt_p, sf(T["dov"], T["hes"]))
+    ws.write_formula(r_dtot, 9, f"=SUM(J{r_d0+1}:J{r_dother+1})", tt_p, 1.0 if T["dov"] else 0.0)
+    if nd:
+        ws.conditional_format(r_d0, 7, r_d1, 7, {"type": "data_bar", "bar_color": "#8FAADC", "bar_solid": True})
+        ws.conditional_format(r_d0, 8, r_d1, 8, {"type": "2_color_scale", "min_color": "#F8CBAD", "max_color": "#C6E0B4"})
+
+    # ---------- qeydlər ----------
+    ws.set_row(r_nbar, 22)
+    ws.merge_range(r_nbar, 0, r_nbar, 11, "METODOLOJİ QEYDLƏR", sect)
+    notes = [
+        "1. Xəstələr müraciət tarixinə görə aya aid edilir. Xidmət, həkim qazancı və ödənişlər həmin xəstələr üçün məlumat tarixinə qədər kumulyativdir.",
+        "2. Dərman satış və alış məbləği dərmanın işlənmə tarixinə görədir (FORMTYPE 2, 3, 10) və sistem hesabatı ilə uyğundur. Ona görə dərman və digər göstəricilər fərqli dövr əsasında birləşir.",
+        "3. Dövriyyə (xalis) = Cəmi hesablanmış − Dərman alış (maya) − Həkim qazancı. Ümumi inzibati və kommunal xərclər daxil deyil.",
+        "4. Ödənilmiş məbləğ (avans + nağd − avans qaytarma) xəstə üzrədir və şöbələrə hesablanmış məbləğ payına görə bölünüb. Xəstənin dəqiq borcu 'Xəstə_borc' vərəqindədir.",
+        "5. 'Digər' sətri şöbəyə aid olmayan depoları və xidmət/dərmanı olmayan xəstələrin ödənişlərini əhatə edir. Cəmi sətri yuxarıdakı göstəricilərə bərabərdir.",
+    ]
+    for i, t in enumerate(notes):
+        ws.set_row(r_nbar + 1 + i, 28)
+        ws.merge_range(r_nbar + 1 + i, 0, r_nbar + 1 + i, 11, t, f_note)
+
+    # ---------- çap ----------
+    last = r_nbar + len(notes)
+    ws.set_landscape(); ws.set_paper(9); ws.fit_to_pages(1, 0)
+    ws.print_area(0, 0, last, 11)
+    ws.set_margins(left=0.4, right=0.4, top=0.5, bottom=0.6)
+    ws.set_h_pagebreaks([r_cbar, r_dbar])
+    ws.set_footer('&L&"Arial,Italic"&8Konfidensial — daxili istifadə üçün&C&"Arial"&8&P / &N&R&"Arial"&8&D')
+
+
+def write_workbook(path, reg, pat, derm, mapper, asof=None):
+    from xlsxwriter.utility import xl_col_to_name
+    ALL = "Hamısı"
+    with pd.ExcelWriter(path, engine="xlsxwriter", datetime_format="dd.mm.yyyy") as xw:
+        wb = xw.book
+        ORDER = ["Rəhbərlik icmalı", "Şöbə icmalı", "Aylıq icmal", "Reyestr", "Xəstə_borc", "Dərman_icmal",
+                 "Nəzarət", "Mapping", "Siyahı", "İzah"]
+        SH = {n: wb.add_worksheet(n) for n in ORDER}   # vərəqlər düzgün ardıcıllıqla əvvəldən yaradılır
+        F = lambda **k: wb.add_format({"font_name": "Arial", "font_size": 10, **k})
+        f_h = F(bold=True, align="center", valign="vcenter", border=1, bg_color="#D9E1F2", text_wrap=True)
+        f_t = F(border=1); f_m = F(border=1, num_format="#,##0.00"); f_i = F(border=1, num_format="0")
+        f_d = F(border=1, num_format="dd.mm.yyyy"); f_fm = F(border=1, num_format="#,##0.00", bg_color="#F2F2F2")
+        f_tot = F(bold=True, border=1, num_format="#,##0.00", bg_color="#E2EFDA")
+        f_toti = F(bold=True, border=1, num_format="0", bg_color="#E2EFDA")
+        f_tott = F(bold=True, border=1, bg_color="#E2EFDA")
+        f_title = F(bold=True, font_size=13); f_note = F(italic=True, font_color="#595959", text_wrap=True, valign="top")
+        f_in = F(bold=True, border=1, bg_color="#FFF2CC"); f_gray = F(font_color="#A6A6A6")
+        f_pct = F(border=1, num_format="0.0%")
+
+        L = {k: xl_col_to_name(i) for i, (k, *_r) in enumerate(REG_COLS)}   # sütun hərfləri
+        N = len(reg) + 1                                                    # son data sətri
+        R = lambda k: f"Reyestr!${L[k]}$2:${L[k]}${N}"
+
+        sobeler = sorted(set(reg["SOBE"].unique()) | set(derm["SOBE"].unique()))
+        aylar = sorted(set(reg["AY"].unique()) | set(derm["AY"].unique()))
+
+        # ---------------- Reyestr ----------------
+        ws = SH["Reyestr"]; xw.sheets["Reyestr"] = ws
+        for c, (k, h, t, w) in enumerate(REG_COLS):
+            ws.write(0, c, h, f_h); ws.set_column(c, c, w)
+        for i, rd in enumerate(reg.to_dict("records"), start=1):
+            r = i + 1
+            for c, (k, h, t, w) in enumerate(REG_COLS):
+                v = rd[k]
+                if t == "f":
+                    ws.write_formula(i, c, FORMULAS[k].format(r=r, **L), f_fm, float(v))
+                elif t == "d":
+                    ws.write_datetime(i, c, pd.Timestamp(v).to_pydatetime(), f_d) if pd.notna(v) else ws.write_blank(i, c, None, f_d)
+                elif t in ("m", "i"):
+                    if pd.isna(v):
+                        ws.write_blank(i, c, None, f_i)
+                    else:
+                        ws.write_number(i, c, float(v), f_m if t == "m" else f_i)
+                else:
+                    ws.write(i, c, "" if pd.isna(v) else v, f_t)
+        ws.set_row(0, 42); ws.freeze_panes(1, 3); ws.autofilter(0, 0, N - 1, len(REG_COLS) - 1)
+
+        # ---------------- Siyahı (açılan siyahılar) ----------------
+        wl = SH["Siyahı"]; xw.sheets["Siyahı"] = wl
+        wl.write(0, 0, "Şöbə", f_h); wl.write(0, 1, "Müraciət ayı", f_h); wl.set_column(0, 1, 32)
+        for i, s in enumerate([ALL] + sobeler, start=1): wl.write(i, 0, s, f_t)
+        for i, a in enumerate([ALL] + aylar, start=1): wl.write(i, 1, a, f_t)
+        src_sobe = f"='Siyahı'!$A$2:$A${len(sobeler) + 2}"
+        src_ay = f"='Siyahı'!$B$2:$B${len(aylar) + 2}"
+
+        # ---------------- Dərman_icmal (işlənmə tarixi üzrə) ----------------
+        wd = SH["Dərman_icmal"]; xw.sheets["Dərman_icmal"] = wd
+        wd.write_row(0, 0, ["Ay (işlənmə tarixi)", "Şöbə (depo)", "Dərman satış", "Dərman alış"], f_h)
+        wd.set_column(0, 0, 18); wd.set_column(1, 1, 36); wd.set_column(2, 3, 16)
+        for i, rw in enumerate(derm.to_dict("records"), start=1):
+            wd.write(i, 0, rw["AY"], f_t); wd.write(i, 1, rw["SOBE"], f_t)
+            wd.write_number(i, 2, float(rw["DERMAN_SATIS"]), f_m); wd.write_number(i, 3, float(rw["DERMAN_ALIS"]), f_m)
+        ND = max(len(derm) + 1, 2)
+        DR = lambda col: f"'Dərman_icmal'!${col}$2:${col}${ND}"
+
+        # ---------------- Şöbə icmalı ----------------
+        wi = SH["Şöbə icmalı"]; xw.sheets["Şöbə icmalı"] = wi
+        wi.write(0, 0, "ŞÖBƏLƏR ÜZRƏ İCMAL", f_title)
+        wi.write(2, 0, "Ay (seçin)", f_t); wi.write(2, 1, ALL, f_in)
+        wi.data_validation(2, 1, 2, 1, {"validate": "list", "source": src_ay})
+        wi.write_formula(2, 3, '=IF($B$3="Hamısı","*",$B$3)', f_gray, "*")
+        heads = ["Şöbə", "Xəstə sayı (unikal)", "Xidmət – xəstə məbləği", "Xidmət – təşkilat məbləği", "Xidmət cəmi",
+                 "Dərman satış (işlənmə tarixi üzrə)", "Cəmi hesablanmış", "Dərman alış (işlənmə tarixi üzrə)",
+                 "Həkim qazancı", "Dövriyyə (xalis)", "Ödənilmiş xidmət məbləği", "Qalıq borc"]
+        for c, h in enumerate(heads): wi.write(4, c, h, f_h)
+        wi.set_column(0, 0, 34); wi.set_column(1, len(heads) - 1, 16); wi.set_row(4, 54)
+        sums = {}
+        for i, s_ in enumerate(sobeler):
+            r = 5 + i; x = r + 1
+            rg = reg[reg["SOBE"] == s_]; dg = derm[derm["SOBE"] == s_]
+            xx, xt = float(rg["XID_XESTE"].sum()), float(rg["XID_TESK"].sum())
+            ds, da = float(dg["DERMAN_SATIS"].sum()), float(dg["DERMAN_ALIS"].sum())
+            hk, od = float(rg["HK_CEMI"].sum()), float(rg["ODENILMIS"].sum())
+            xc = xx + xt; hes = xc + ds; dov = hes - da - hk; qal = hes - od
+            vals = [len(rg), xx, xt, xc, ds, hes, da, hk, dov, od, qal]
+            for c, vv in enumerate(vals, start=1): sums[c] = sums.get(c, 0) + vv
+            wi.write(r, 0, s_, f_t)
+            wi.write_formula(r, 1, f'=COUNTIFS({R("SOBE")},$A{x},{R("AY")},$D$3)', f_i, vals[0])
+            wi.write_formula(r, 2, f'=SUMIFS({R("XID_XESTE")},{R("SOBE")},$A{x},{R("AY")},$D$3)', f_m, xx)
+            wi.write_formula(r, 3, f'=SUMIFS({R("XID_TESK")},{R("SOBE")},$A{x},{R("AY")},$D$3)', f_m, xt)
+            wi.write_formula(r, 4, f"=C{x}+D{x}", f_m, xc)
+            wi.write_formula(r, 5, f'=SUMIFS({DR("C")},{DR("B")},$A{x},{DR("A")},$D$3)', f_m, ds)
+            wi.write_formula(r, 6, f"=E{x}+F{x}", f_m, hes)
+            wi.write_formula(r, 7, f'=SUMIFS({DR("D")},{DR("B")},$A{x},{DR("A")},$D$3)', f_m, da)
+            wi.write_formula(r, 8, f'=SUMIFS({R("HK_CEMI")},{R("SOBE")},$A{x},{R("AY")},$D$3)', f_m, hk)
+            wi.write_formula(r, 9, f"=G{x}-H{x}-I{x}", f_m, dov)
+            wi.write_formula(r, 10, f'=SUMIFS({R("ODENILMIS")},{R("SOBE")},$A{x},{R("AY")},$D$3)', f_m, od)
+            wi.write_formula(r, 11, f"=G{x}-K{x}", f_m, qal)
+        rt = 5 + len(sobeler)
+        wi.write(rt, 0, "CƏMİ", f_tott)
+        wi.write_formula(rt, 1, f'=SUMIFS({R("UNIKAL")},{R("AY")},$D$3)', f_toti, int(reg["UNIKAL"].sum()))
+        for c in range(2, 12):
+            col = xl_col_to_name(c)
+            wi.write_formula(rt, c, f"=SUM({col}6:{col}{rt})", f_tot, float(sums.get(c, 0)))
+        wi.merge_range(rt + 2, 0, rt + 5, 8,
+                       "Qeyd: Dərman satış/alış dərmanın İŞLƏNMƏ TARİXİNƏ görə (seçilən təqvim ayı, depo → şöbə), sistem hesabatı ilə "
+                       "uyğundur. Xidmət, həkim qazancı və ödəniş xəstənin MÜRACİƏT AYINA görədir. Buna görə bu vərəqdə "
+                       "'Cəmi hesablanmış', 'Dövriyyə' və 'Qalıq' iki fərqli dövr əsasını birləşdirir. 'Xəstə sayı' cəmi distinct "
+                       "HK_ID-dir; eyni xəstə bir neçə şöbədə olduqda şöbə sətirlərinin cəmindən az ola bilər.", f_note)
+        wi.freeze_panes(5, 1); wi.autofilter(4, 0, rt - 1, len(heads) - 1)
+
+        # ---------------- Aylıq icmal (şablon formatı + seçimlər) ----------------
+        wa = SH["Aylıq icmal"]; xw.sheets["Aylıq icmal"] = wa
+        wa.write(0, 0, "AYLIQ İDARƏETMƏ HESABATI (müraciət ayına görə)", f_title)
+        wa.write(3, 0, "Müraciət ayı (seçin)", f_t); wa.write(3, 1, ALL, f_in)
+        wa.write(4, 0, "Şöbə (seçin)", f_t); wa.write(4, 1, ALL, f_in)
+        wa.data_validation(3, 1, 3, 1, {"validate": "list", "source": src_ay})
+        wa.data_validation(4, 1, 4, 1, {"validate": "list", "source": src_sobe})
+        wa.write_formula(3, 3, '=IF($B$4="Hamısı","*",$B$4)', f_gray, "*")
+        wa.write_formula(4, 3, '=IF($B$5="Hamısı","*",$B$5)', f_gray, "*")
+        wa.write(5, 0, "Göstərici", f_h); wa.write(5, 1, "Məbləğ / say", f_h)
+        wa.set_column(0, 0, 44); wa.set_column(1, 1, 18)
+        rows = [("Xəstə sayı (unikal)", None), ("Xidmət – xəstə məbləği (HI_HTUTAR)", "XID_XESTE"),
+                ("Xidmət – təşkilat məbləği (HI_KTUTAR)", "XID_TESK"), ("Xidmət cəmi", "XID_CEMI"),
+                ("Dərman (satış)", "DERMAN_SATIS"), ("Cəmi hesablanmış", "HESABLANMIS"),
+                ("Ödənilmiş (avans + nağd − qaytarma, pay)", "ODENILMIS"), ("Qalıq borc", "QALIQ"),
+                ("Dərman alış (maya)", "DERMAN_ALIS"), ("Həkim qazancı (icra)", "HK_YAPAN"),
+                ("Həkim qazancı (göndərən)", "HK_GONDEREN"), ("Həkim qazancı cəmi", "HK_CEMI"),
+                ("Dövriyyə (xalis)", "DOVRIYYE")]
+        pos = {}
+        for i, (h, k) in enumerate(rows):
+            r = 6 + i; pos[k] = r + 1
+            wa.write(r, 0, h, f_t)
+            if k is None:
+                wa.write_formula(r, 1,
+                                 f'=IF($B$5="Hamısı",SUMIFS({R("UNIKAL")},{R("AY")},$D$4),COUNTIFS({R("AY")},$D$4,{R("SOBE")},$D$5))',
+                                 f_i, int(reg["UNIKAL"].sum()))
+            else:
+                wa.write_formula(r, 1, f'=SUMIFS({R(k)},{R("AY")},$D$4,{R("SOBE")},$D$5)', f_m, float(reg[k].sum()))
+        rr = 6 + len(rows)
+        wa.write(rr, 0, "Dövriyyə / Cəmi hesablanmış", f_t)
+        hes = float(reg["HESABLANMIS"].sum()); dov = float(reg["DOVRIYYE"].sum())
+        wa.write_formula(rr, 1, f"=IFERROR(B{pos['DOVRIYYE']}/B{pos['HESABLANMIS']},0)", f_pct, dov / hes if hes else 0)
+        wa.merge_range(rr + 2, 0, rr + 4, 1,
+                       "Qeyd: Xəstələr müraciət tarixinə görə aya aid edilir; məbləğlər hesabat tarixinə qədər kumulyativdir. "
+                       "Dövriyyə = Cəmi hesablanmış − Dərman alış − Həkim qazancı. Ödənilmiş məbləğ xəstə üzrə olduğu üçün "
+                       "şöbələrə hesablanmış məbləğ payına görə bölünüb. Ümumi inzibati xərclər daxil deyil.", f_note)
+
+        # ---------------- Xəstə_borc ----------------
+        wp = SH["Xəstə_borc"]; xw.sheets["Xəstə_borc"] = wp
+        pcols = [("AY", "Müraciət ayı", "t", 10), ("KOD", "Xəstə kodu", "t", 14), ("HASTA_TURU", "Xəstə növü", "t", 12),
+                 ("STATUS", "Xəstə statusu", "t", 12), ("MURACIET", "Müraciət tarixi", "d", 12), ("CIXIS", "Çıxış tarixi", "d", 12),
+                 ("AVANS_K", "Avans", "m", 13), ("NEGD_K", "Nağd", "m", 13),
+                 ("XID_K", "Xidmətlər", "m", 13), ("DERMAN_K", "Dərmanlar", "m", 13),
+                 ("AVANSDAN_K", "Avansdan xərclənən", "m", 14), ("QAYT_K", "Avans qaytarma", "m", 13),
+                 ("BORC_K", "Borc (−) / Alacaq (+)", "m", 14)]
+        for c, (k, h, t, w) in enumerate(pcols):
+            wp.write(0, c, h, f_h); wp.set_column(c, c, w)
+        for i, rw in enumerate(pat.to_dict("records"), start=1):
+            for c, (k, h, t, w) in enumerate(pcols):
+                v = rw[k]
+                if t == "d":
+                    wp.write_datetime(i, c, pd.Timestamp(v).to_pydatetime(), f_d) if pd.notna(v) else wp.write_blank(i, c, None, f_d)
+                elif t == "m":
+                    wp.write_number(i, c, float(v or 0), f_m)
+                else:
+                    wp.write(i, c, "" if pd.isna(v) else v, f_t)
+        wp.set_row(0, 42); wp.freeze_panes(1, 2); wp.autofilter(0, 0, len(pat), len(pcols) - 1)
+        NP = len(pat) + 1
+        pl = {k: xl_col_to_name(i) for i, (k, *_r) in enumerate(pcols)}
+        PS = lambda k: f"SUM('Xəstə_borc'!${pl[k]}$2:${pl[k]}${NP})"
+
+        # ---------------- Nəzarət ----------------
+        wn = SH["Nəzarət"]; xw.sheets["Nəzarət"] = wn
+        wn.write(0, 0, "UZLAŞDIRMA YOXLAMALARI (borc hesabatı məntiqi ilə)", f_title)
+        wn.write_row(2, 0, ["Yoxlama", "Reyestr", "Borc hesabatı məntiqi", "Fərq"], f_h)
+        wn.set_column(0, 0, 56); wn.set_column(1, 3, 20)
+        v = lambda s: float(s)
+        checks = [("Xidmət cəmi (HI_HTUTAR + HI_KTUTAR  ↔  H_HASTAKAYIT_ALT)", f"=SUM({R('XID_CEMI')})", f"={PS('XID_K')}",
+                   v(reg["XID_CEMI"].sum()), v(pat["XID_K"].sum())),
+                  ("Dərman satış (V_STOK_LIST…  ↔  STOK_CIKISDETAY MIKTAR×FIYAT)", f"=SUM({R('DERMAN_SATIS')})", f"={PS('DERMAN_K')}",
+                   v(reg["DERMAN_SATIS"].sum()), v(pat["DERMAN_K"].sum())),
+                  ("Ödənilmiş (avans + nağd − qaytarma)", f"=SUM({R('ODENILMIS')})", f"={PS('AVANS_K')}+{PS('NEGD_K')}-{PS('QAYT_K')}",
+                   v(reg["ODENILMIS"].sum()), v((pat["AVANS_K"] + pat["NEGD_K"] - pat["QAYT_K"]).sum()))]
+        for i, (h, f1, f2, v1, v2) in enumerate(checks):
+            r = 3 + i
+            wn.write(r, 0, h, f_t); wn.write_formula(r, 1, f1, f_m, v1); wn.write_formula(r, 2, f2, f_m, v2)
+            wn.write_formula(r, 3, f"=B{r+1}-C{r+1}", f_m, v1 - v2)
+        n_orph = int((reg["SOBE"] == "Bölüşdürülməyib").sum()); n_dep = int((reg["SOBE"] == NOT_SOBE_LABEL).sum())
+        n_unk = int((reg["SOBE"] == "Təyin olunmayıb").sum())
+        for i, (h, lab, cnt) in enumerate([("'Bölüşdürülməyib' sətirləri (ödəniş var, xidmət/dərman yox)", "Bölüşdürülməyib", n_orph),
+                                           (f"'{NOT_SOBE_LABEL}' sətirləri", NOT_SOBE_LABEL, n_dep),
+                                           ("'Təyin olunmayıb' sətirləri (boş şöbə adı)", "Təyin olunmayıb", n_unk)]):
+            r = 7 + i
+            wn.write(r, 0, h, f_t); wn.write_formula(r, 1, f'=COUNTIFS({R("SOBE")},"{lab}")', f_i, cnt)
+        wn.merge_range(11, 0, 15, 3,
+                       "Fərq 0-a yaxın olmalıdır. Xidmət fərqi: V_IST_GENEL_HIZMET ilə H_HASTAKAYIT_ALT arasında endirim / "
+                       "sığortalı qiymət fərqi. Dərman fərqi: V_STOK_LIST_CIKISFISDETAY (DERMAN_WHERE, SNLTUTAR, SNLALISTUTAR) ilə "
+                       "STOK_CIKISDETAY (MIKTAR×FIYAT) arasındakı fərq; sistem hesabatı ilə uyğunlaşdırma üçün skriptin başındakı "
+                       "DERMAN_*_EXPR sətirlərini dəyişin.", f_note)
+
+        # ---------------- Mapping ----------------
+        wm = SH["Mapping"]; xw.sheets["Mapping"] = wm
+        wm.write_row(0, 0, ["Mənbə adı", "Mənbə növü", "Şöbə (nəticə)", "Üsul"], f_h); wm.set_column(0, 2, 40); wm.set_column(3, 3, 12)
+        for i, ((nm, kind), (res, how)) in enumerate(sorted(mapper.log.items(), key=lambda x: (x[1][0], x[0][1], x[0][0])), start=1):
+            wm.write_row(i, 0, [nm, kind, res, how], f_t)
+        wm.autofilter(0, 0, len(mapper.log), 3)
+
+        # ---------------- İzah ----------------
+        wz = SH["İzah"]; xw.sheets["İzah"] = wz
+        wz.set_column(0, 0, 32); wz.set_column(1, 1, 110)
+        wz.write_row(0, 0, ["Sütun / anlayış", "İzah"], f_h)
+        izah = [
+            ("Seçmə qaydası", "Xəstə müraciət tarixi (H_HASTAKAYIT.HK_MURACAATTAR) seçilən ayda olan xəstələr. Onların bütün xidmət, dərman, hakediş və ödənişləri hesabat tarixinə qədər kumulyativ götürülür."),
+            ("Qrain", "Reyestrin hər sətri bir Müraciət ayı × Şöbə × Xəstə (HK_ID) kombinasiyasıdır."),
+            ("Xəstə sayı", "Distinct HK_ID. Şöbə sətrində = sətir sayı; ümumi cəmdə 'Xəstə (unikal)' sütunu istifadə olunur (hər HK_ID-nin ilk sətri = 1)."),
+            ("Yatış / Nəql tarixi", "H_YHNAKIL: GELIS_TARIH (min) / NAKIL_TARIH (max), şöbə = GELIS_SERVISID. Ambulator xəstələrdə boşdur. Çıxış tarixi = H_HASTAKAYIT.HK_CIKISTARIHI."),
+            ("Yatış günü", "Yatış tarixi ilə (nəql tarixi, yoxsa çıxış tarixi, yoxsa hesabat tarixi) arasındakı gün sayı; minimum 1. Ambulatorda boşdur."),
+            ("İlk / Son xidmət tarixi", "Şöbədə həmin xəstəyə göstərilən xidmətlərin ən erkən və ən gec tarixi (HI_TARIH). Dərman tarixləri daxil deyil."),
+            ("Xidmət – xəstə / təşkilat məbləği", "HI_HTUTAR (xəstə) və HI_KTUTAR (təşkilat). Xidmət cəmi = ikisinin cəmi. İcbari ayrıca ayrılmır."),
+            ("Şöbə (xidmət, hakediş)", "V_IST_GENEL_HIZMET / V_HAKEDIS_RAPOR-dakı SR_ADI (icra edən şöbə)."),
+            ("Şöbə (dərman)", "V_STOK_LIST_CIKISFISDETAY-dəki DEPOADI. 'Teserrufat' / 'Tes.' sonluqlu depolar əsas şöbəyə birləşir (Mapping vərəqinə baxın)."),
+            ("Dərman (satış / alış)", "Skriptin başındakı DERMAN_SATIS_EXPR, DERMAN_ALIS_EXPR, DERMAN_WHERE (defolt: SNLTUTAR, SNLALISTUTAR, FORMTYPE = 2)."),
+            ("Şöbə icmalı – dərman", "Dərman satış/alış dərmanın işlənmə tarixinə (TARIH) görə, seçilən təqvim ayı üzrə (vərəq: Dərman_icmal). Xidmət, hakediş və ödəniş müraciət ayına görədir."),
+            ("Ödənilmiş (pay)", "Xəstənin hesabat tarixinə qədər kumulyativ avans + nağd − avans qaytarma; xəstə üzrədir, şöbələrə hesablanmış məbləğ payına görə bölünüb. Şöbə icmalında başlıq: 'Ödənilmiş xidmət məbləği'."),
+            ("Qalıq borc", "Cəmi hesablanmış − Ödənilmiş (pay). Xəstənin real kumulyativ borcu 'Xəstə_borc' vərəqindədir (borc botu ilə eyni məntiq)."),
+            ("Həkim qazancı", "V_HAKEDIS_RAPOR.HAKTUTAR: HAKEDISTURU 1 = icra (Yapan), 2 = göndərən (Gonderen). Şöbə = icra edilən xidmətin şöbəsi."),
+            ("Dövriyyə (xalis)", "Cəmi hesablanmış − Dərman alış − Həkim qazancı (rentabel hesabatındakı düstur). İnzibati/kommunal xərclər daxil deyil."),
+            ("Məhdudiyyət", "ƏDV ayrılmayıb (məbləğlər ƏDV-lidir)."),
+        ]
+        for i, (a, b) in enumerate(izah, start=1):
+            wz.write(i, 0, a, F(bold=True, border=1, valign="top")); wz.write(i, 1, b, F(border=1, text_wrap=True, valign="top"))
+        xw.sheets["Rəhbərlik icmalı"] = SH["Rəhbərlik icmalı"]
+        write_exec_sheet(wb, SH["Rəhbərlik icmalı"], F, R, DR, reg, derm, src_ay, aylar, asof)
+        SH["Rəhbərlik icmalı"].activate(); SH["Rəhbərlik icmalı"].set_first_sheet()
+
+
+# ============================================================================
+#  DB və DEMO
+# ============================================================================
+def month_ranges(start, end):
+    y, m = map(int, start.split("-")); ye, me = map(int, end.split("-"))
+    out = []
+    while (y, m) <= (ye, me):
+        d1 = date(y, m, 1)
+        y2, m2 = (y + 1, 1) if m == 12 else (y, m + 1)
+        out.append((f"{y:04d}-{m:02d}", d1, date(y2, m2, 1)))
+        y, m = y2, m2
+    return out
+
+
+def fetch_month(conn, d1, d2, d3):
+    allp = {"d1": d1, "d2": d2, "d3": d3}
+
+    def q(sql):   # yalnız SQL-də istifadə olunan bind-ləri ötür
+        return pd.read_sql(sql, conn, params={k: v for k, v in allp.items() if f":{k}" in sql})
+    return q(SQL_XIDMET), q(SQL_DERMAN), q(SQL_HAKEDIS), q(SQL_YATIS), q(build_patient_sql()), q(SQL_DERMAN_AY)
+
+
+def demo_month(label, d1, seed=7):
+    import numpy as np
+    rng = np.random.default_rng(seed)
+    sr = ["Reanimasiya Şöbəsi", "Pediatriya Reanimasiya", "Cərrahiyyə Şöbəsi", "Terapiya Şöbəsi", "Ambulator Qəbul"]
+    depo = ["Reanimasiya Şöbəsi", "Reanimasiya Teserrufat", "Pediatriya Reanimasiya", "Pediatriya Reanimasiya Tes.",
+            "Cərrahiyyə Şöbəsi", "Terapiya Şöbəsi", "Reanimasiya Cihaz Ve Envanter Deposu"]
+    ids = list(range(1000, 1060))
+    ts = lambda: pd.Timestamp(d1) + pd.Timedelta(days=int(rng.integers(0, 40)))
+    xr, dr, hr, yr = [], [], [], []
+    for h in ids:
+        for s in rng.choice(sr, size=int(rng.integers(1, 3)), replace=False):
+            a, b = ts(), ts()
+            xr.append(dict(HK_ID=h, SOBE_MENBE=s, ILK_TARIX=min(a, b), SON_TARIX=max(a, b),
+                           XID_XESTE=round(rng.uniform(0, 900), 2), XID_TESK=round(rng.uniform(0, 600) * (h % 3 == 0), 2)))
+            hr.append(dict(HK_ID=h, SOBE_MENBE=s, HK_YAPAN=round(rng.uniform(0, 150), 2), HK_GONDEREN=round(rng.uniform(0, 40), 2)))
+            if h % 2:
+                yr.append(dict(HK_ID=h, SOBE_MENBE=s, YATIS_TARIXI=min(a, b), NEQL_TARIXI=max(a, b)))
+        for d in rng.choice(depo, size=int(rng.integers(0, 3)), replace=False):
+            v = round(rng.uniform(5, 400), 2)
+            dr.append(dict(HK_ID=h, SOBE_MENBE=d, DERMAN_SATIS=v, DERMAN_ALIS=round(v * 0.65, 2)))
+    xid, der, hak, yat = pd.DataFrame(xr), pd.DataFrame(dr), pd.DataFrame(hr), pd.DataFrame(yr)
+    pr = []
+    for h in ids + [2001, 2002]:
+        xs = float(xid.loc[xid.HK_ID == h, ["XID_XESTE", "XID_TESK"]].sum().sum())
+        ds = float(der.loc[der.HK_ID == h, "DERMAN_SATIS"].sum())
+        av = round(rng.uniform(0, 500), 2) if h % 2 else 0.0
+        ng = round((xs + ds) * rng.uniform(0.2, 0.9), 2)
+        pr.append(dict(HK_ID=h, KOD=f"GG{h}", HASTA_TURU=("Y-Yatan" if h % 2 else "A-Ayaktan"), HSINIF=int(rng.choice([1, 2])),
+                       MURACIET=pd.Timestamp(d1) + pd.Timedelta(days=int(rng.integers(0, 28))),
+                       CIXIS=pd.NaT if h % 4 == 0 else pd.Timestamp(d1) + pd.Timedelta(days=30),
+                       AVANS_K=av, NEGD_K=ng, XID_K=xs, DERMAN_K=ds, AVANSDAN_K=0.0, QAYT_K=0.0))
+    dfay = der.groupby("SOBE_MENBE", as_index=False)[["DERMAN_SATIS", "DERMAN_ALIS"]].sum()
+    return xid, der, hak, yat, pd.DataFrame(pr), dfay
+
+
+def unique_name(base):
+    if not os.path.exists(base): return base
+    stem, ext = os.path.splitext(base); i = 1
+    while os.path.exists(f"{stem}_{i}{ext}"): i += 1
+    return f"{stem}_{i}{ext}"
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    today = date.today()
+    # defolt: cari ilin yanvarından bu günə qədər (arqumentsiz işlədəndə bütün il)
+    ap.add_argument("--from", dest="start", default=f"{today.year}-01")
+    ap.add_argument("--to", dest="end", default=None)
+    ap.add_argument("--asof", default=None, help="YYYY-MM-DD: bu tarixə qədər (daxil) olan əməliyyatlar; defolt: bu gün")
+    ap.add_argument("--demo", action="store_true")
+    ap.add_argument("--mapping", default="sobe_mapping.csv")
+    ap.add_argument("--out", default=".")
+    a = ap.parse_args()
+    a.end = a.end or today.strftime("%Y-%m")   # defolt: cari ay (gələcək aylar avtomatik atılır)
+    asof = date.fromisoformat(a.asof) if a.asof else today
+    d3 = asof + timedelta(days=1)
+
+    mapper = SobeMapper(load_mapping(a.mapping))
+    regs, pats, ders = [], [], []
+    conn = None
+
+    if not a.demo:
+        import oracledb
+        cdir = os.environ.get("ORACLE_CLIENT_DIR", INSTANT_CLIENT_DIR)
+        if cdir and os.path.exists(cdir):
+            try:
+                oracledb.init_oracle_client(lib_dir=cdir)
+            except Exception as e:
+                print("Oracle Client xəbərdarlığı:", e)
+
+        user = os.environ.get("DB_USER", DB_USER)
+        pw   = os.environ.get("DB_PASS", DB_PASS)
+        dsn  = os.environ.get("DB_DSN", DB_DSN)
+        conn = oracledb.connect(user=user, password=pw, dsn=dsn)
+
+    try:
+        for label, d1, d2 in month_ranges(a.start, a.end):
+            if d1 > asof:
+                print(f"→ {label} atlandı (hesabat tarixindən sonradır)")
+                continue
+            print(f"→ {label} (müraciət ayı) emal edilir...")
+            xid, der, hak, yat, pat, dfay = demo_month(label, d1) if a.demo else fetch_month(conn, d1, d2, d3)
+            print(f"   {label}: xəstə={len(pat)}, xidmət sətri={len(xid)}, dərman(xəstə)={len(der)}, "
+                  f"hakediş={len(hak)}, dərman(işlənmə)={len(dfay)}")
+            if pat.empty and dfay.empty:
+                print(f"   {label}: məlumat yoxdur, atlandı")
+                continue
+            mapper.learn(sum((list(f["SOBE_MENBE"]) for f in (xid, der, hak, yat, dfay)), []))
+            regs.append(build_registry(label, xid, der, hak, yat, pat, mapper, asof))
+            ders.append(build_derman_ay(label, dfay, mapper))
+            pats.append(build_patient_sheet(label, pat))
+    finally:
+        if conn:
+            conn.close()
+
+    reg_df = pd.concat(regs, ignore_index=True)
+    pat_df = pd.concat(pats, ignore_index=True)
+    derm_df = pd.concat(ders, ignore_index=True)
+    if reg_df.empty:
+        sys.exit("Seçilmiş dövr üçün məlumat tapılmadı.")
+
+    os.makedirs(a.out, exist_ok=True)
+    fname = f"sobe_maliyye_reyestri_{a.start}" + (f"_{a.end}" if a.end != a.start else "") + (".DEMO" if a.demo else "") + ".xlsx"
+    out_path = unique_name(os.path.join(a.out, fname))
+
+    print(f"→ Hesabata düşən aylar: {', '.join(sorted(reg_df['AY'].unique()))}")
+    print("→ Excel faylı yazılır...")
+    write_workbook(out_path, reg_df, pat_df, derm_df, mapper, asof)
+    print(f"✓ Hazırdır: {out_path}")
+
+
+if __name__ == "__main__":
+    main()
