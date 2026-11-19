@@ -1,0 +1,1202 @@
+#!/home/nuran/bot_env/bin/python3
+"""
+FONET — Silinən və Ləğv Edilən Xidmətlər üzrə Gündəlik Risk Məruzəsi
+=====================================================================
+
+İstifadə:
+    python imc_silinme.py                       # DAİMİ REJİM: hər gün 12:00-da dünən üzrə göndərir (systemd)
+    python imc_silinme.py --once                # dərhal bir dəfə dünən üzrə göndər
+    python imc_silinme.py --date 2026-11-18     # istənilən gün üçün (backfill)
+    python imc_silinme.py --dry-run             # email göndərmir, ./out/ qovluğuna HTML + XLSX yazır
+    python imc_silinme.py --demo --dry-run      # bazasız, nümunə məlumatla dizayna baxış
+    python imc_silinme.py --to a@x.az,b@x.az    # alıcıları müvəqqəti dəyişmək
+"""
+from __future__ import annotations
+
+import argparse
+import html
+import io
+import logging
+import os
+import smtplib
+import sys
+import time
+from datetime import date, datetime, timedelta
+from email.message import EmailMessage
+from email.utils import formataddr, formatdate, make_msgid
+from logging.handlers import RotatingFileHandler
+from zoneinfo import ZoneInfo
+
+import pandas as pd
+from openpyxl import Workbook
+from openpyxl.chart import BarChart, Reference
+from openpyxl.formatting.rule import DataBarRule
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  KONFİQURASİYA
+# ═══════════════════════════════════════════════════════════════════
+LOG_FILE = os.path.join(BASE_DIR, "imc_silinme.log")
+OUT_DIR = os.path.join(BASE_DIR, "out")
+
+# --- BAZA TƏNZİMLƏMƏLƏRİ ---
+DB_CONFIG = {
+    "host": "172.18.37.27",
+    "port": "5432",
+    "dbname": "fonet",
+    "user": "xnuranhasanov",
+    "password": "nur4nH4s4n0v!*!",
+    "connect_timeout": 15,
+    "application_name": "imc_silinme_risk_report",
+}
+QUERY_TIMEOUT_MS = 120_000
+
+# --- EMAIL TƏNZİMLƏMƏLƏRİ ---
+SMTP_SERVER = "smtp.gmail.com"
+SMTP_PORT = 587
+SENDER_EMAIL = "nuranhasanov2003@gmail.com"
+SENDER_PASSWORD = "wdovajmrynizwprh"
+SENDER_NAME = "Analitika və Hesabatlılıq"
+RECEIVER_EMAIL = [
+    "nuranhasanov2003@gmail.com",
+    "kamil.shiraliyev@azeraholding.az",
+    "akif.aliyev@azeraholding.az",
+]
+CC_EMAIL: list[str] = []                         # Surət (CC) ünvanları
+ALERT_EMAIL = ["nuranhasanov2003@gmail.com"]     # Xəta bildirişləri yalnız bura gedir
+
+# --- CƏDVƏL (daemon rejimi) ---
+TIMEZONE = ZoneInfo("Asia/Baku")
+SEND_HOUR, SEND_MINUTE = 12, 0                   # hər gün 12:00-da dünən üzrə hesabat
+RETRY_EVERY_MIN = 15                             # xəta olarsa neçə dəqiqədən bir təkrar
+MAX_DAILY_ATTEMPTS = 4                           # gün ərzində maksimum cəhd
+STATE_FILE = os.path.join(BASE_DIR, ".last_sent")  # restartda təkrar göndərişin qarşısını alır
+SMTP_RETRIES = 3
+
+# --- Risk parametrləri ---
+DELAY_HOUR = 60            # dəqiqə
+DELAY_DAY = 1440           # dəqiqə
+WORK_START, WORK_END = 8, 22   # bu aralıqdan kənar = iş saatından kənar
+AMOUNT_HIGH, AMOUNT_MED = 100, 50
+SCORE_HIGH, SCORE_MED, SCORE_LOW = 65, 45, 15
+TREND_DAYS = 7
+MAX_CARDS_HIGH, MAX_CARDS_MED = 15, 10
+
+LVL_HIGH, LVL_MED, LVL_LOW, LVL_OK = "YÜKSƏK RİSK", "ORTA RİSK", "AŞAĞI RİSK", "NORMAL"
+UNKNOWN_USER = "Naməlum (Boş)"
+PAID = "Ödənişli"
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  SQL — tarix aralığı parametrlə ötürülür (DB saat qurşağından asılı deyil)
+#  Trend üçün hesabat günündən əvvəlki 7 gün də çəkilir.
+# ═══════════════════════════════════════════════════════════════════
+_COMMON_JOINS = """
+             LEFT JOIN fonethbs.hasta_gelis hg ON hg.id = {a}.hasta_gelis_id
+             LEFT JOIN fonethbs.hasta_kurum hk ON hk.id = hg.kurum_id
+             LEFT JOIN fonethbs.hasta ha ON ha.id = hg.hasta_id
+             LEFT JOIN fonethbs.kimlik k_hasta ON k_hasta.id = ha.kimlik_id
+             LEFT JOIN fonethbs.hizmet_makro hm ON hm.id = {a}.makro_id
+             LEFT JOIN fonethbs.kullanici_organizasyon ko1 ON ko1.id = {a}.ekul
+             LEFT JOIN fonethbs.kullanici k1 ON k1.id = ko1.kullanici_id
+             LEFT JOIN fonethbs.kimlik kk_ekul ON kk_ekul.id = k1.kimlik_id
+             LEFT JOIN fonethbs.kullanici_organizasyon ko2 ON ko2.id = {a}.dkul
+             LEFT JOIN fonethbs.kullanici k2 ON k2.id = ko2.kullanici_id
+             LEFT JOIN fonethbs.kimlik kk_dkul ON kk_dkul.id = k2.kimlik_id"""
+
+_COMMON_COLS = """
+           hg.kodu                                                   AS "Protokol no",
+           k_hasta.tc_kimlik_no                                      AS "FİN",
+           CONCAT_WS(' ', k_hasta.adi, k_hasta.soyadi)               AS "Xəstə",
+           CASE WHEN hg.kurum_id IS NULL OR hg.kurum_id = 1
+                THEN 'Ödənişli' ELSE 'Sığortalı' END                 AS "Ödəniş növü",
+           COALESCE(hk.adi, 'ÖDƏNİŞLİ XƏSTƏLƏR')                      AS "Qurum",
+           COALESCE(hm.adi, 'Naməlum xidmət')                        AS "Xidmət adı",
+           COALESCE({a}.miktar, 0)                                   AS "Say",
+           COALESCE({a}.hizmet_fiyat, 0)                             AS "Qiymət",
+           TO_CHAR({a}.etar, 'DD.MM.YYYY HH24:MI')                   AS "Yaradılma tarixi",
+           COALESCE(kk_ekul.adi_soyadi, 'Təyin edilməyib')           AS "Əlavə edən",
+           COALESCE(kk_dkul.adi_soyadi, 'Naməlum (Boş)')             AS "Silən / Ləğv edən",
+           k1.id                                                     AS ekul_uid,
+           k2.id                                                     AS dkul_uid"""
+
+SQL_QUERY = f"""
+SELECT * FROM (
+    SELECT t.flg_log_tarih                                                 AS raw_emeliyyat,
+           ROUND(EXTRACT(EPOCH FROM (t.flg_log_tarih - t.etar)) / 60.0, 1) AS ferq_deqiqe,
+           'Silinmə'                                                       AS "Əməliyyat",
+           TO_CHAR(t.flg_log_tarih, 'DD.MM.YYYY HH24:MI')                  AS "Əməliyyat tarixi",
+           {_COMMON_COLS.format(a="t")}
+    FROM fonetlog.flg_hasta_hizmet t
+    {_COMMON_JOINS.format(a="t")}
+    WHERE t.flg_log_tipi = 'D'
+      AND t.flg_log_tarih >= %(start)s
+      AND t.flg_log_tarih <  %(end)s
+
+    UNION ALL
+
+    SELECT h.dtar                                                          AS raw_emeliyyat,
+           ROUND(EXTRACT(EPOCH FROM (h.dtar - h.etar)) / 60.0, 1)          AS ferq_deqiqe,
+           'Ləğv edilmə (Anulat)'                                          AS "Əməliyyat",
+           TO_CHAR(h.dtar, 'DD.MM.YYYY HH24:MI')                           AS "Əməliyyat tarixi",
+           {_COMMON_COLS.format(a="h")}
+    FROM fonethbs.hasta_hizmet h
+    {_COMMON_JOINS.format(a="h")}
+    WHERE h.hizmet_tipi = 3
+      AND h.dtar >= %(start)s
+      AND h.dtar <  %(end)s
+) x
+ORDER BY raw_emeliyyat DESC NULLS LAST;
+"""
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  LOG
+# ═══════════════════════════════════════════════════════════════════
+def setup_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[
+            RotatingFileHandler(LOG_FILE, maxBytes=2_000_000, backupCount=5, encoding="utf-8"),
+            logging.StreamHandler(),
+        ],
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  MƏLUMATIN ÇƏKİLMƏSİ
+# ═══════════════════════════════════════════════════════════════════
+def fetch_data(start: datetime, end: datetime) -> pd.DataFrame:
+    import psycopg2
+
+    if not DB_CONFIG["password"]:
+        raise RuntimeError("DB_CONFIG-də parol boşdur.")
+
+    t0 = time.perf_counter()
+    conn = psycopg2.connect(**DB_CONFIG)
+    try:
+        conn.set_session(readonly=True)
+        with conn.cursor() as cur:
+            cur.execute("SET statement_timeout = %s", (QUERY_TIMEOUT_MS,))
+            cur.execute(SQL_QUERY, {"start": start, "end": end})
+            rows = cur.fetchall()
+            columns = [d[0] for d in cur.description]
+    finally:
+        conn.close()
+    logging.info(f"Bazadan {len(rows)} sətir çəkildi ({time.perf_counter() - t0:.1f} san).")
+    return pd.DataFrame(rows, columns=columns)
+
+
+def demo_data(report_day: date) -> pd.DataFrame:
+    """Bazasız test / dizayn baxışı üçün real görünüşlü nümunə məlumat."""
+    import random
+    rnd = random.Random(42)
+    users = ["Aysel Məmmədova", "Rəşad Əliyev", "Günay Hüseynova", "Elvin Quliyev", "Nigar Kərimova"]
+    services = [("Ümumi qan analizi", 18), ("USM — qarın boşluğu", 60), ("MRT — bel", 220),
+                ("Kardioloq müayinəsi", 50), ("EKQ", 25), ("KT — döş qəfəsi", 180),
+                ("Biokimyəvi panel", 75), ("Endoskopiya", 150), ("Fizioterapiya seansı", 35)]
+    insurers = ["PAŞA Sığorta", "AtaŞğorta", "Mega Sığorta", "Xalq Sığorta"]
+    names = ["Orxan Babayev", "Leyla Nəsibova", "Kamran Rzayev", "Səbinə Əhmədova", "Tural İsmayılov",
+             "Fidan Cəfərova", "Vüsal Abbasov", "Aynur Mustafayeva", "Rauf Həsənli", "Könül Vəliyeva"]
+    rows = []
+    for d in range(TREND_DAYS + 1):
+        day = report_day - timedelta(days=d)
+        for _ in range(rnd.randint(14, 30) if d else 34):
+            hour = rnd.choices(range(24), weights=[1]*7 + [4, 8, 10, 10, 9, 6, 8, 9, 8, 6, 4, 3, 2, 2, 2, 1, 1])[0]
+            op = datetime.combine(day, datetime.min.time()) + timedelta(hours=hour, minutes=rnd.randint(0, 59))
+            delay = rnd.choice([rnd.uniform(0.5, 9), rnd.uniform(10, 59), rnd.uniform(60, 600), rnd.uniform(1440, 7200)]
+                               if rnd.random() < 0.6 else [rnd.uniform(0.5, 9)])
+            svc, price = rnd.choice(services)
+            paid = rnd.random() < 0.55
+            creator_i = rnd.randrange(len(users))
+            deleter_i = creator_i if rnd.random() < 0.25 else rnd.randrange(len(users))
+            unknown = rnd.random() < 0.08
+            created = op - timedelta(minutes=delay)
+            pat = rnd.randrange(len(names))
+            rows.append({
+                "raw_emeliyyat": op, "ferq_deqiqe": round(delay, 1),
+                "Əməliyyat": rnd.choice(["Silinmə", "Silinmə", "Ləğv edilmə (Anulat)"]),
+                "Əməliyyat tarixi": op.strftime("%d.%m.%Y %H:%M"),
+                "Protokol no": str(4_510_000 + pat * 37), "FİN": f"{pat:02d}AB{pat*7 % 100:02d}X",
+                "Xəstə": names[pat], "Ödəniş növü": PAID if paid else "Sığortalı",
+                "Qurum": "ÖDƏNİŞLİ XƏSTƏLƏR" if paid else insurers[pat % len(insurers)],
+                "Xidmət adı": svc, "Say": rnd.choice([1, 1, 1, 2]), "Qiymət": price,
+                "Yaradılma tarixi": created.strftime("%d.%m.%Y %H:%M"),
+                "Əlavə edən": users[creator_i],
+                "Silən / Ləğv edən": UNKNOWN_USER if unknown else users[deleter_i],
+                "ekul_uid": creator_i, "dkul_uid": None if unknown else deleter_i,
+            })
+    return pd.DataFrame(rows)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  ZƏNGİNLƏŞDİRMƏ VƏ RİSK BALI
+# ═══════════════════════════════════════════════════════════════════
+def format_duration(mins: float) -> str:
+    if pd.isna(mins):
+        return "—"
+    if mins < 0:
+        return "⚠ mənfi"
+    mins = int(mins)
+    if mins < 60:
+        return f"{mins} dəq"
+    hours, rem_m = divmod(mins, 60)
+    if hours < 24:
+        return f"{hours} saat {rem_m} dəq" if rem_m else f"{hours} saat"
+    days, rem_h = divmod(hours, 24)
+    return f"{days} gün {rem_h} saat" if rem_h else f"{days} gün"
+
+
+def money(x: float) -> str:
+    return f"{x:,.2f} ₼"
+
+
+def score_row(r) -> tuple[int, str]:
+    """
+    Şəffaf, bal əsaslı risk modeli (0–100). Köhnə qaydalarla tam uyğundur:
+      ≥1 gün + ödənişli / ≥100 ₼           → YÜKSƏK
+      ≥1 gün, və ya ≥1 saat + ödənişli + ≥50 ₼ → ORTA
+      ≥1 saat                              → AŞAĞI
+    üstəlik yeni siqnallar: özü əlavə edib özü silib, naməlum icraçı, iş saatından kənar, tarix anomaliyası.
+    """
+    mins, amount, paid = r["ferq_deqiqe"], r["Məbləğ"], r["Ödəniş növü"] == PAID
+    score, why = 0, []
+
+    if mins >= DELAY_DAY:
+        score += 45; why.append(f"{format_duration(mins)} sonra silinib")
+    elif mins >= DELAY_HOUR:
+        score += 15; why.append(f"{format_duration(mins)} sonra silinib")
+
+    if mins >= DELAY_HOUR:
+        if paid:
+            score += 20; why.append("ödənişli xidmət")
+        if amount >= AMOUNT_HIGH:
+            score += 25; why.append(f"yüksək məbləğ (≥{AMOUNT_HIGH} ₼)")
+        elif amount >= AMOUNT_MED:
+            score += 10; why.append(f"orta məbləğ (≥{AMOUNT_MED} ₼)")
+        if r["ozu_sildi"]:
+            score += 15; why.append("əlavə edən özü silib")
+
+    if r["Silən / Ləğv edən"] == UNKNOWN_USER:
+        score += 15; why.append("icraçı naməlum")
+    if r["is_saatindan_kenar"]:
+        score += 10; why.append("iş saatından kənar")
+    if mins < 0:
+        score += 10; why.append("tarix anomaliyası")
+
+    return min(score, 100), "; ".join(why) if why else "—"
+
+
+def level_for(score: int) -> str:
+    if score >= SCORE_HIGH:
+        return LVL_HIGH
+    if score >= SCORE_MED:
+        return LVL_MED
+    if score >= SCORE_LOW:
+        return LVL_LOW
+    return LVL_OK
+
+
+def enrich_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    df = df.copy()
+    df["Say"] = pd.to_numeric(df["Say"], errors="coerce").fillna(0)
+    df["Qiymət"] = pd.to_numeric(df["Qiymət"], errors="coerce").fillna(0.0)
+    # Say boşdursa/0-dırsa 1 kimi qəbul edilir ki, məbləğ itməsin
+    df["Məbləğ"] = df["Qiymət"] * df["Say"].where(df["Say"] > 0, 1)
+    df["ferq_deqiqe"] = pd.to_numeric(df["ferq_deqiqe"], errors="coerce").fillna(0.0)
+    df["raw_emeliyyat"] = pd.to_datetime(df["raw_emeliyyat"])
+    df["gun"] = df["raw_emeliyyat"].dt.date
+    df["saat"] = df["raw_emeliyyat"].dt.hour
+    df["is_saatindan_kenar"] = (df["saat"] < WORK_START) | (df["saat"] >= WORK_END)
+    df["ozu_sildi"] = df["ekul_uid"].notna() & (df["ekul_uid"] == df["dkul_uid"])
+    df["Xəstə"] = df["Xəstə"].fillna("").replace("", "—")
+    df["Gecikmə müddəti"] = df["ferq_deqiqe"].apply(format_duration)
+
+    scored = df.apply(score_row, axis=1, result_type="expand")
+    df["Risk balı"] = scored[0].astype(int)
+    df["Risk səbəbi"] = scored[1]
+    df["Risk səviyyəsi"] = df["Risk balı"].apply(level_for)
+    return df
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  STATİSTİKA, TREND VƏ AVTOMATİK MÜŞAHİDƏLƏR
+# ═══════════════════════════════════════════════════════════════════
+def compute_stats(df: pd.DataFrame, hist: pd.DataFrame, report_day: date) -> dict:
+    st: dict = {}
+    st["total_ops"] = len(df)
+    st["total_amount"] = float(df["Məbləğ"].sum()) if len(df) else 0.0
+    st["patients"] = int(df["FİN"].fillna(df["Protokol no"]).nunique()) if len(df) else 0
+    st["visits"] = int(df["Protokol no"].nunique()) if len(df) else 0
+
+    # 7 günlük trend (boş günlər 0 kimi sayılır)
+    days = [report_day - timedelta(days=i) for i in range(1, TREND_DAYS + 1)]
+    if len(hist):
+        daily = hist.groupby("gun").agg(cnt=("Məbləğ", "size"), amt=("Məbləğ", "sum")).reindex(days, fill_value=0)
+    else:
+        daily = pd.DataFrame({"cnt": 0, "amt": 0.0}, index=days)
+    st["avg_cnt"] = float(daily["cnt"].mean())
+    st["avg_amt"] = float(daily["amt"].mean())
+    st["trend_days"] = [(d, int(daily.loc[d, "cnt"]), float(daily.loc[d, "amt"])) for d in reversed(days)]
+
+    if not len(df):
+        return st
+
+    for lvl, key in ((LVL_HIGH, "high"), (LVL_MED, "med"), (LVL_LOW, "low"), (LVL_OK, "ok")):
+        sub = df[df["Risk səviyyəsi"] == lvl]
+        st[f"{key}_cnt"], st[f"{key}_amt"] = len(sub), float(sub["Məbləğ"].sum())
+
+    paid = df[df["Ödəniş növü"] == PAID]
+    st["paid_cnt"], st["paid_amt"] = len(paid), float(paid["Məbləğ"].sum())
+    st["ins_cnt"], st["ins_amt"] = len(df) - len(paid), st["total_amount"] - st["paid_amt"]
+
+    hc = df.groupby("saat").size()
+    st["hour_counts"] = hc.reindex(range(24), fill_value=0)
+    st["peak_hour"], st["peak_count"] = int(hc.idxmax()), int(hc.max())
+
+    st["unknown"] = df[df["Silən / Ləğv edən"] == UNKNOWN_USER]
+    st["self_late"] = df[df["ozu_sildi"] & (df["ferq_deqiqe"] >= DELAY_HOUR)]
+    st["off_hours"] = df[df["is_saatindan_kenar"]]
+    st["anomaly"] = df[df["ferq_deqiqe"] < 0]
+
+    per_proto = df.groupby(["Protokol no", "Xəstə"]).agg(n=("Məbləğ", "size"), amt=("Məbləğ", "sum"))
+    st["repeat_protocols"] = per_proto[per_proto["n"] >= 3].sort_values("amt", ascending=False).reset_index()
+
+    st["top_services"] = (
+        df.groupby("Xidmət adı").agg(n=("Məbləğ", "size"), amt=("Məbləğ", "sum"))
+        .sort_values(["n", "amt"], ascending=False).head(5).reset_index()
+    )
+
+    st["users"] = (
+        df.groupby("Silən / Ləğv edən")
+        .agg(
+            cnt=("Məbləğ", "size"),
+            high=("Risk səviyyəsi", lambda s: int((s == LVL_HIGH).sum())),
+            med=("Risk səviyyəsi", lambda s: int((s == LVL_MED).sum())),
+            self_late=("ozu_sildi", "sum"),
+            avg_delay=("ferq_deqiqe", "median"),
+            amt=("Məbləğ", "sum"),
+            max_score=("Risk balı", "max"),
+        )
+        .sort_values(["high", "amt"], ascending=False)
+        .reset_index()
+    )
+    # özü sildiyi — yalnız 1 saatdan gec olanlar
+    late_self = st["self_late"].groupby("Silən / Ləğv edən").size()
+    st["users"]["self_late"] = st["users"]["Silən / Ləğv edən"].map(late_self).fillna(0).astype(int)
+
+    st["biggest"] = df.loc[df["Məbləğ"].idxmax()]
+    return st
+
+
+def pct_change(cur: float, avg: float) -> float | None:
+    return None if avg <= 0 else (cur - avg) / avg * 100
+
+
+def build_insights(df: pd.DataFrame, st: dict) -> list[str]:
+    """Rəqəmlərdən avtomatik, insan dilində əsas müşahidələr."""
+    e = html.escape
+    out: list[str] = []
+
+    ch = pct_change(st["total_ops"], st["avg_cnt"])
+    if ch is not None and abs(ch) >= 20:
+        word = "yüksəkdir" if ch > 0 else "aşağıdır"
+        out.append(f"Silinmə sayı son {TREND_DAYS} günün ortalamasından (<b>{st['avg_cnt']:.1f}</b>) "
+                   f"<b>{abs(ch):.0f}% {word}</b>.")
+
+    if st["high_cnt"]:
+        share = st["high_amt"] / st["total_amount"] * 100 if st["total_amount"] else 0
+        out.append(f"Ümumi məbləğin <b>{share:.0f}%-i ({money(st['high_amt'])})</b> cəmi "
+                   f"<b>{st['high_cnt']} yüksək riskli</b> əməliyyatda cəmlənib.")
+
+    users = st["users"]
+    if len(users) > 1:
+        top = users.sort_values("cnt", ascending=False).iloc[0]
+        share = top["cnt"] / st["total_ops"] * 100
+        if share >= 40:
+            out.append(f"Əməliyyatların <b>{share:.0f}%-i</b> bir əməkdaşın — <b>{e(str(top['Silən / Ləğv edən']))}</b> "
+                       f"— adına düşür ({int(top['cnt'])} əməliyyat, {money(top['amt'])}).")
+
+    if len(st["self_late"]):
+        out.append(f"<b>{len(st['self_late'])} xidmət</b> onu əlavə edən əməkdaşın <b>özü tərəfindən 1 saatdan gec</b> "
+                   f"silinib ({money(st['self_late']['Məbləğ'].sum())}) — vəzifə bölgüsü nəzarəti tövsiyə olunur.")
+
+    if len(st["off_hours"]):
+        out.append(f"<b>{len(st['off_hours'])} əməliyyat</b> iş saatından kənar "
+                   f"({WORK_END:02d}:00–{WORK_START:02d}:00) aparılıb ({money(st['off_hours']['Məbləğ'].sum())}).")
+
+    rp = st["repeat_protocols"]
+    if len(rp):
+        r0 = rp.iloc[0]
+        out.append(f"<b>{len(rp)} protokolda</b> 3 və daha çox xidmət silinib (paket/vizit ləğvi). Ən böyüyü: "
+                   f"#{e(str(r0['Protokol no']))} — {int(r0['n'])} xidmət, {money(r0['amt'])}.")
+
+    if len(st["anomaly"]):
+        out.append(f"<b>{len(st['anomaly'])} qeyddə</b> silinmə tarixi yaradılma tarixindən əvvəldir — məlumat bütövlüyü yoxlanmalıdır.")
+
+    b = st["biggest"]
+    out.append(f"Ən böyük tək əməliyyat: <b>{e(str(b['Xidmət adı']))}</b> — {money(b['Məbləğ'])} "
+               f"(protokol #{e(str(b['Protokol no']))}, icraçı: {e(str(b['Silən / Ləğv edən']))}).")
+
+    if not st["high_cnt"] and not len(st["self_late"]) and not len(st["unknown"]):
+        out.insert(0, "Kritik risk siqnalı aşkarlanmayıb — əməliyyatların əksəriyyəti operativ düzəlişlərdir.")
+    return out[:7]
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  EXCEL (3 vərəq: İcmal, Detallar, İstifadəçilər) — yaddaşda yaradılır
+# ═══════════════════════════════════════════════════════════════════
+NAVY, BLUE = "102A43", "1E3A8A"
+F_TITLE = Font(name="Calibri", size=14, bold=True, color="FFFFFF")
+F_HEAD = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+F_BODY = Font(name="Calibri", size=10, color="1E293B")
+F_BOLD = Font(name="Calibri", size=10, bold=True, color="1E293B")
+F_TOTAL = Font(name="Calibri", size=11, bold=True, color=BLUE)
+FILL = lambda c: PatternFill(start_color=c, end_color=c, fill_type="solid")  # noqa: E731
+THIN = Side(border_style="thin", color="CBD5E1")
+BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
+LEFT = Alignment(horizontal="left", vertical="center")
+RIGHT = Alignment(horizontal="right", vertical="center")
+MONEY_FMT = '#,##0.00 "₼"'
+LEVEL_STYLE = {
+    LVL_HIGH: (FILL("FEE2E2"), Font(name="Calibri", size=10, bold=True, color="991B1B")),
+    LVL_MED: (FILL("FEF3C7"), Font(name="Calibri", size=10, bold=True, color="92400E")),
+    LVL_LOW: (FILL("E0F2FE"), Font(name="Calibri", size=10, color="075985")),
+    LVL_OK: (FILL("ECFDF5"), Font(name="Calibri", size=10, color="065F46")),
+}
+
+DETAIL_COLS = [
+    # (sütun, en, düzləndirmə, format)
+    ("Risk balı", 9, CENTER, "0"),
+    ("Risk səviyyəsi", 15, CENTER, None),
+    ("Protokol no", 13, CENTER, None),
+    ("FİN", 11, CENTER, None),
+    ("Xəstə", 24, LEFT, None),
+    ("Ödəniş növü", 12, CENTER, None),
+    ("Qurum", 22, LEFT, None),
+    ("Xidmət adı", 34, LEFT, None),
+    ("Say", 7, CENTER, "#,##0"),
+    ("Qiymət", 12, RIGHT, MONEY_FMT),
+    ("Məbləğ", 13, RIGHT, MONEY_FMT),
+    ("Yaradılma tarixi", 16, CENTER, None),
+    ("Əlavə edən", 22, LEFT, None),
+    ("Əməliyyat", 19, CENTER, None),
+    ("Əməliyyat tarixi", 16, CENTER, None),
+    ("Gecikmə müddəti", 15, CENTER, None),
+    ("Silən / Ləğv edən", 22, LEFT, None),
+    ("Risk səbəbi", 48, LEFT, None),
+]
+
+
+def _title(ws, text: str, ncols: int, sub: str | None = None) -> None:
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=ncols)
+    c = ws.cell(row=1, column=1, value=text)
+    c.font, c.fill, c.alignment = F_TITLE, FILL(NAVY), CENTER
+    ws.row_dimensions[1].height = 30
+    if sub:
+        ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=ncols)
+        s = ws.cell(row=2, column=1, value=sub)
+        s.font = Font(name="Calibri", size=9, italic=True, color="64748B")
+        s.alignment = LEFT
+
+
+def _header(ws, row: int, headers: list[str]) -> None:
+    ws.row_dimensions[row].height = 26
+    for i, h in enumerate(headers, start=1):
+        c = ws.cell(row=row, column=i, value=h)
+        c.font, c.fill, c.alignment, c.border = F_HEAD, FILL(BLUE), CENTER, BORDER
+
+
+def _write_detail_sheet(ws, df: pd.DataFrame, report_date: str) -> None:
+    names = [c[0] for c in DETAIL_COLS]
+    n = len(names)
+    _title(ws, f"SİLİNƏN VƏ LƏĞV EDİLƏN XİDMƏTLƏR — DETALLAR ({report_date})", n,
+           "Risk balına görə sıralanıb. Cəmi sətri filtrə uyğun yenilənir (SUBTOTAL).")
+    hdr = 3
+    _header(ws, hdr, names)
+
+    data = df.sort_values(["Risk balı", "raw_emeliyyat"], ascending=[False, False])[names]
+    zebra = FILL("F8FAFC")
+    lvl_idx = names.index("Risk səviyyəsi") + 1
+    for r_off, row in enumerate(data.itertuples(index=False), start=1):
+        r = hdr + r_off
+        for c_idx, (val, (_, _, align, fmt)) in enumerate(zip(row, DETAIL_COLS), start=1):
+            cell = ws.cell(row=r, column=c_idx, value=val)
+            cell.font, cell.border, cell.alignment = F_BODY, BORDER, align
+            if fmt:
+                cell.number_format = fmt
+            if r_off % 2 == 0:
+                cell.fill = zebra
+        fill, font = LEVEL_STYLE[row[lvl_idx - 1]]
+        lc = ws.cell(row=r, column=lvl_idx)
+        lc.fill, lc.font = fill, font
+
+    first, last = hdr + 1, hdr + len(data)
+    total = last + 1
+    ws.row_dimensions[total].height = 24
+    for c_idx in range(1, n + 1):
+        c = ws.cell(row=total, column=c_idx)
+        c.fill, c.font = FILL("EFF6FF"), F_TOTAL
+        c.border = Border(top=Side(border_style="medium", color=BLUE),
+                          bottom=Side(border_style="double", color=BLUE), left=THIN, right=THIN)
+    ws.cell(row=total, column=1, value="CƏMİ").alignment = CENTER
+    pc = names.index("Protokol no") + 1
+    ws.cell(row=total, column=pc,
+            value=f'=SUBTOTAL(103,{get_column_letter(pc)}{first}:{get_column_letter(pc)}{last})&" əməliyyat"'
+            ).alignment = CENTER
+    for col_name, fmt in (("Say", "#,##0"), ("Məbləğ", MONEY_FMT)):
+        ci = names.index(col_name) + 1
+        L = get_column_letter(ci)
+        c = ws.cell(row=total, column=ci, value=f"=SUBTOTAL(109,{L}{first}:{L}{last})")
+        c.number_format, c.alignment = fmt, RIGHT if col_name == "Məbləğ" else CENTER
+
+    for i, (_, width, _, _) in enumerate(DETAIL_COLS, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = width
+    sc = get_column_letter(names.index("Risk balı") + 1)
+    ws.conditional_formatting.add(f"{sc}{first}:{sc}{last}",
+                                  DataBarRule(start_type="num", start_value=0, end_type="num", end_value=100,
+                                              color="F87171", showValue=True))
+    ws.freeze_panes = ws.cell(row=hdr + 1, column=names.index("Xəstə") + 1)
+    ws.auto_filter.ref = f"A{hdr}:{get_column_letter(n)}{last}"
+    ws.sheet_view.zoomScale = 90
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.fitToWidth, ws.page_setup.fitToHeight = 1, 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.print_title_rows = f"{hdr}:{hdr}"
+
+
+def _write_users_sheet(ws, st: dict, report_date: str) -> None:
+    headers = ["Əməkdaş", "Cəmi əməliyyat", "Yüksək risk", "Orta risk", "Özü sildiyi (1 saat+)",
+               "Median gecikmə", "Maks. risk balı", "Məbləğ"]
+    _title(ws, f"İSTİFADƏÇİLƏR ÜZRƏ İCMAL ({report_date})", len(headers))
+    _header(ws, 3, headers)
+    for i, r in enumerate(st["users"].itertuples(index=False), start=4):
+        vals = [r[0], r.cnt, r.high or None, r.med or None, r.self_late or None,
+                format_duration(r.avg_delay), r.max_score, r.amt]
+        for c_idx, v in enumerate(vals, start=1):
+            c = ws.cell(row=i, column=c_idx, value=v)
+            c.font, c.border = F_BODY, BORDER
+            c.alignment = LEFT if c_idx == 1 else (RIGHT if c_idx == 8 else CENTER)
+        ws.cell(row=i, column=8).number_format = MONEY_FMT
+        if r.high:
+            ws.cell(row=i, column=3).font = Font(name="Calibri", size=10, bold=True, color="B91C1C")
+        if r[0] == UNKNOWN_USER:
+            ws.cell(row=i, column=1).font = Font(name="Calibri", size=10, bold=True, color="BE123C")
+    for i, w in enumerate([28, 15, 13, 11, 20, 16, 15, 15], start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    ws.freeze_panes = "B4"
+
+
+def _write_summary_sheet(ws, df: pd.DataFrame, st: dict, report_date: str) -> None:
+    _title(ws, f"RİSK HESABATI — İCMAL ({report_date})", 6,
+           f"Tərtib olunub: {datetime.now():%d.%m.%Y %H:%M}")
+    for i, w in enumerate([30, 16, 18, 4, 14, 14], start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    def kv_block(start_row: int, title: str, rows: list[tuple]) -> int:
+        _header(ws, start_row, [title, "Say", "Məbləğ"])
+        for i, (k, cnt, amt) in enumerate(rows, start=start_row + 1):
+            ws.cell(row=i, column=1, value=k).font = F_BOLD
+            ws.cell(row=i, column=2, value=cnt).alignment = CENTER
+            m = ws.cell(row=i, column=3, value=amt)
+            m.number_format, m.alignment = MONEY_FMT, RIGHT
+            for c in range(1, 4):
+                ws.cell(row=i, column=c).border = BORDER
+            if k in LEVEL_STYLE:
+                ws.cell(row=i, column=1).fill, ws.cell(row=i, column=1).font = LEVEL_STYLE[k]
+        return start_row + len(rows) + 2
+
+    ch_cnt = pct_change(st["total_ops"], st["avg_cnt"])
+    r = kv_block(3, "Əsas göstəricilər", [
+        ("Cəmi əməliyyat", st["total_ops"], st["total_amount"]),
+        (f"{TREND_DAYS} günlük ortalama", round(st["avg_cnt"], 1), st["avg_amt"]),
+        ("Ortalamadan fərq", f"{ch_cnt:+.0f}%" if ch_cnt is not None else "—", None),
+        ("Unikal pasiyent / vizit", f"{st['patients']} / {st['visits']}", None),
+        ("Ödənişli", st["paid_cnt"], st["paid_amt"]),
+        ("Sığortalı", st["ins_cnt"], st["ins_amt"]),
+    ])
+    r = kv_block(r, "Risk səviyyəsi", [
+        (LVL_HIGH, st["high_cnt"], st["high_amt"]), (LVL_MED, st["med_cnt"], st["med_amt"]),
+        (LVL_LOW, st["low_cnt"], st["low_amt"]), (LVL_OK, st["ok_cnt"], st["ok_amt"]),
+    ])
+    r = kv_block(r, "Nəzarət siqnalları", [
+        ("Özü əlavə edib, 1 saat+ sonra özü silib", len(st["self_late"]), float(st["self_late"]["Məbləğ"].sum())),
+        ("İcraçı naməlum", len(st["unknown"]), float(st["unknown"]["Məbləğ"].sum())),
+        ("İş saatından kənar", len(st["off_hours"]), float(st["off_hours"]["Məbləğ"].sum())),
+        ("Tarix anomaliyası", len(st["anomaly"]), float(st["anomaly"]["Məbləğ"].sum())),
+    ])
+
+    # Saatlıq paylanma + qrafik (E-F sütunları)
+    _hdr_cells = [("Saat", 5), ("Əməliyyat", 6)]
+    for txt, col in _hdr_cells:
+        c = ws.cell(row=3, column=col, value=txt)
+        c.font, c.fill, c.alignment, c.border = F_HEAD, FILL(BLUE), CENTER, BORDER
+    for h in range(24):
+        ws.cell(row=4 + h, column=5, value=f"{h:02d}:00").alignment = CENTER
+        ws.cell(row=4 + h, column=6, value=int(st["hour_counts"][h])).alignment = CENTER
+        for col in (5, 6):
+            ws.cell(row=4 + h, column=col).border = BORDER
+    chart = BarChart()
+    chart.title = "Saatlar üzrə əməliyyatlar"
+    chart.y_axis.title, chart.x_axis.title = "Say", "Saat"
+    chart.legend = None
+    chart.add_data(Reference(ws, min_col=6, min_row=3, max_row=27), titles_from_data=True)
+    chart.set_categories(Reference(ws, min_col=5, min_row=4, max_row=27))
+    chart.series[0].graphicalProperties.solidFill = "1E3A8A"
+    chart.height, chart.width = 7.5, 16
+    ws.add_chart(chart, "H3")
+
+    # 7 günlük trend
+    _header(ws, r, ["Tarix (trend)", "Əməliyyat", "Məbləğ"])
+    for i, (d, cnt, amt) in enumerate(st["trend_days"] + [(None, st["total_ops"], st["total_amount"])], start=r + 1):
+        ws.cell(row=i, column=1, value=d.strftime("%d.%m.%Y") if d else f"{report_date} (hesabat günü)")
+        ws.cell(row=i, column=2, value=cnt).alignment = CENTER
+        m = ws.cell(row=i, column=3, value=amt)
+        m.number_format, m.alignment = MONEY_FMT, RIGHT
+        for c in range(1, 4):
+            ws.cell(row=i, column=c).border = BORDER
+        if d is None:
+            for c in range(1, 4):
+                ws.cell(row=i, column=c).font = F_BOLD
+                ws.cell(row=i, column=c).fill = FILL("EFF6FF")
+    ws.sheet_view.showGridLines = False
+
+
+def build_excel(df: pd.DataFrame, st: dict, report_date: str) -> bytes:
+    wb = Workbook()
+    _write_summary_sheet(wb.active, df, st, report_date)
+    wb.active.title = "İcmal"
+    _write_detail_sheet(wb.create_sheet("Detallar"), df, report_date)
+    _write_users_sheet(wb.create_sheet("İstifadəçilər"), st, report_date)
+    wb.properties.creator = SENDER_NAME
+    wb.properties.title = f"Silinən xidmətlər risk hesabatı {report_date}"
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  EMAIL HTML — cədvəl əsaslı (Outlook / Gmail / mobil uyğun)
+# ═══════════════════════════════════════════════════════════════════
+FONT = "'Segoe UI', Arial, sans-serif"
+
+
+def _h3(num: int, text: str, color: str = "#1e3a8a", bar: str = "#1d4ed8") -> str:
+    return (f'<h3 style="color:{color}; font-size:15px; margin:26px 0 10px 0; border-left:4px solid {bar}; '
+            f'padding-left:10px; font-family:{FONT};">{num}. {text}</h3>')
+
+
+def _trend_html(cur: float, avg: float, fmt) -> str:
+    ch = pct_change(cur, avg)
+    if ch is None:
+        return '<span style="color:#94a3b8;">ortalama yoxdur</span>'
+    if abs(ch) < 5:
+        arrow, color = "≈", "#64748b"
+    elif ch > 0:
+        arrow, color = "▲", "#dc2626"
+    else:
+        arrow, color = "▼", "#16a34a"
+    return (f'<span style="color:{color}; font-weight:700;">{arrow} {abs(ch):.0f}%</span>'
+            f'<span style="color:#94a3b8;"> · ort. {fmt(avg)}</span>')
+
+
+def _kpi_tile(label: str, value: str, sub: str, accent: str) -> str:
+    return f"""
+    <td width="25%" valign="top" style="padding:0 5px;">
+      <table width="100%" cellpadding="0" cellspacing="0" role="presentation"
+             style="background:#ffffff; border:1px solid #e2e8f0; border-top:3px solid {accent}; border-radius:6px;">
+        <tr><td style="padding:12px 12px 4px; font-size:11px; color:#64748b; font-weight:700; text-transform:uppercase; letter-spacing:.4px;">{label}</td></tr>
+        <tr><td style="padding:0 12px; font-size:20px; font-weight:800; color:#0f172a; white-space:nowrap;">{value}</td></tr>
+        <tr><td style="padding:4px 12px 12px; font-size:11px;">{sub}</td></tr>
+      </table>
+    </td>"""
+
+
+def _hour_bars(st: dict) -> str:
+    hc = st["hour_counts"]
+    active = [h for h in range(24) if hc[h] > 0]
+    if not active:
+        return ""
+    mx = max(hc)
+    rows = ""
+    for h in range(min(active), max(active) + 1):
+        n = int(hc[h])
+        w = max(round(n / mx * 100), 1) if n else 0
+        off = h < WORK_START or h >= WORK_END
+        color = "#d97706" if h == st["peak_hour"] else ("#e11d48" if off else "#3b82f6")
+        bar = (f'<table width="100%" cellpadding="0" cellspacing="0" role="presentation"><tr>'
+               f'<td width="{w}%" height="12" bgcolor="{color}" style="background:{color}; border-radius:3px; font-size:0; line-height:0;">&nbsp;</td>'
+               f'<td style="font-size:0;">&nbsp;</td></tr></table>') if n else ""
+        rows += (f'<tr><td width="52" style="font-size:11px; color:#64748b; padding:2px 6px 2px 0;">{h:02d}:00</td>'
+                 f'<td style="padding:2px 0;">{bar}</td>'
+                 f'<td width="34" align="right" style="font-size:11px; color:#334155; font-weight:700; padding:2px 0 2px 6px;">{n or ""}</td></tr>')
+    legend = ('<span style="color:#d97706;">■</span> pik saat &nbsp; '
+              '<span style="color:#e11d48;">■</span> iş saatından kənar &nbsp; '
+              '<span style="color:#3b82f6;">■</span> iş saatı')
+    return (f'<table width="100%" cellpadding="0" cellspacing="0" role="presentation">{rows}</table>'
+            f'<div style="font-size:11px; color:#64748b; margin-top:6px;">{legend}</div>')
+
+
+def _risk_cards(sub: pd.DataFrame, limit: int, border: str, badge_bg: str, badge_fg: str) -> str:
+    e = html.escape
+    sub = sub.sort_values("Risk balı", ascending=False)
+    grouped = (
+        sub.groupby(["Protokol no", "Xəstə", "Ödəniş növü", "Qurum", "Silən / Ləğv edən"], dropna=False, sort=False)
+        .agg(
+            n=("Xidmət adı", "count"),
+            svc=("Xidmət adı", lambda s: ", ".join(list(dict.fromkeys(s))[:3]) + (" …" if s.nunique() > 3 else "")),
+            max_delay=("ferq_deqiqe", "max"),
+            amt=("Məbləğ", "sum"),
+            score=("Risk balı", "max"),
+            why=("Risk səbəbi", "first"),
+        )
+        .sort_values(["score", "amt"], ascending=False)
+        .reset_index()
+    )
+    out = ""
+    for _, r in grouped.head(limit).iterrows():
+        label = PAID if r["Ödəniş növü"] == PAID else f"Sığortalı · {r['Qurum']}"
+        out += f"""
+        <table width="100%" cellpadding="0" cellspacing="0" role="presentation"
+               style="margin-bottom:8px; background:#ffffff; border:1px solid #e2e8f0; border-left:4px solid {border}; border-radius:6px;">
+          <tr>
+            <td style="padding:10px 14px 2px; font-size:13.5px; color:#0f172a;">
+              <b>Protokol #{e(str(r['Protokol no']))}</b> — {e(str(r['Xəstə']))}
+              <span style="background:{badge_bg}; color:{badge_fg}; padding:2px 7px; border-radius:4px; font-size:11px; font-weight:700; white-space:nowrap;">{e(label)}</span>
+            </td>
+            <td align="right" valign="top" style="padding:10px 14px 2px; font-size:14px; font-weight:800; color:#0f172a; white-space:nowrap;">{money(r['amt'])}</td>
+          </tr>
+          <tr><td colspan="2" style="padding:3px 14px 10px; font-size:12px; color:#475569; line-height:1.55;">
+              <b>{int(r['n'])} xidmət</b> ({e(str(r['svc']))}) • Gecikmə: <b>{format_duration(r['max_delay'])}</b>
+              • İcraçı: <b>{e(str(r['Silən / Ləğv edən']))}</b> • Bal: <b style="color:{border};">{int(r['score'])}</b><br>
+              <span style="color:#94a3b8;">Səbəb: {e(str(r['why']))}</span>
+          </td></tr>
+        </table>"""
+    rest = len(grouped) - limit
+    if rest > 0:
+        out += f'<div style="font-size:12px; color:#64748b; margin:2px 0 4px;">+ daha {rest} protokol — tam siyahı Excel-in <b>Detallar</b> vərəqindədir.</div>'
+    return out
+
+
+def _alert_box(title: str, body: str, bg: str, bd: str, accent: str, fg: str) -> str:
+    return f"""
+    <table width="100%" cellpadding="0" cellspacing="0" role="presentation"
+           style="margin-top:12px; background:{bg}; border:1px solid {bd}; border-left:5px solid {accent}; border-radius:6px;">
+      <tr><td style="padding:12px 16px; font-size:13px; color:{fg}; line-height:1.55;">
+        <div style="font-weight:700; font-size:13.5px; margin-bottom:3px;">{title}</div>{body}
+      </td></tr>
+    </table>"""
+
+
+def _shell(report_date: str, preheader: str, title: str, content: str) -> str:
+    return f"""<!DOCTYPE html>
+<html lang="az"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{html.escape(title)}</title></head>
+<body style="margin:0; padding:0; background-color:#eef2f6;">
+<div style="display:none; max-height:0; overflow:hidden; opacity:0; color:transparent;">{html.escape(preheader)}</div>
+<table width="100%" cellpadding="0" cellspacing="0" role="presentation" bgcolor="#eef2f6" style="background:#eef2f6;">
+<tr><td align="center" style="padding:22px 10px;">
+  <table width="760" cellpadding="0" cellspacing="0" role="presentation"
+         style="max-width:760px; width:100%; background:#ffffff; border:1px solid #cbd5e1; border-radius:10px; font-family:{FONT}; color:#1e293b;">
+    <tr><td bgcolor="#0f172a" style="background:#0f172a; background-image:linear-gradient(135deg,#0f172a 0%,#1e3a8a 100%); padding:26px 30px; border-bottom:4px solid #d97706; border-radius:10px 10px 0 0;">
+      <div style="font-size:11px; letter-spacing:1.5px; color:#fbbf24; font-weight:700; text-transform:uppercase;">Gündəlik məruzə</div>
+      <div style="margin-top:6px; font-size:21px; font-weight:700; color:#ffffff;">{html.escape(title)}</div>
+      <div style="font-size:13px; color:#93c5fd; margin-top:6px;">Hesabat dövrü: <b>{report_date}</b> (00:00 – 23:59)</div>
+    </td></tr>
+    <tr><td style="padding:24px 30px 28px;">{content}</td></tr>
+    <tr><td style="background:#f8fafc; padding:12px 30px; border-top:1px solid #e2e8f0; font-size:11.5px; color:#64748b; border-radius:0 0 10px 10px;">
+      <table width="100%" role="presentation"><tr>
+        <td style="font-size:11.5px; color:#64748b;">{html.escape(SENDER_NAME)} · avtomatik hesabat</td>
+        <td align="right" style="font-size:11.5px; color:#64748b;">Tərtib olunub: <b>{datetime.now():%d.%m.%Y %H:%M}</b></td>
+      </tr></table>
+    </td></tr>
+  </table>
+</td></tr></table>
+</body></html>"""
+
+
+def build_executive_html(df: pd.DataFrame, st: dict, report_date: str) -> str:
+    e = html.escape
+    intro = f"""
+    <table width="100%" cellpadding="0" cellspacing="0" role="presentation"
+           style="background:#eff6ff; border:1px solid #bfdbfe; border-left:5px solid #1d4ed8; border-radius:6px; margin-bottom:20px;">
+      <tr><td style="padding:14px 18px;">
+        <div style="font-size:14.5px; font-weight:700; color:#1e3a8a; margin-bottom:5px;">Hörmətli Rəhbərlik,</div>
+        <div style="font-size:13.5px; line-height:1.6; color:#1e293b;"><b>{report_date}</b> tarixində baş vermiş xidmət
+        silinmələri və ləğv əməliyyatları üzrə risk və nəzarət hesabatı nəzərinizə təqdim edilir.</div>
+      </td></tr>
+    </table>"""
+
+    if df.empty:
+        avg_note = (f" Son {TREND_DAYS} günün ortalaması: <b>{st['avg_cnt']:.1f}</b> əməliyyat."
+                    if st["avg_cnt"] > 0 else "")
+        body = intro + _alert_box("✅ Silinmə qeydə alınmayıb",
+                                  "Qeyd olunan tarixdə sistemdə heç bir xidmət silinməsi və ya ləğv əməliyyatı olmayıb." + avg_note,
+                                  "#f0fdf4", "#bbf7d0", "#16a34a", "#166534")
+        return _shell(report_date, "Dünən heç bir silinmə qeydə alınmayıb.", "Silinən və Ləğv Edilən Xidmətlər Hesabatı", body)
+
+    # --- KPI kafelləri ---
+    high_accent = "#dc2626" if st["high_cnt"] else "#16a34a"
+    kpis = (
+        _kpi_tile("Əməliyyat", f"{st['total_ops']}", _trend_html(st["total_ops"], st["avg_cnt"], lambda v: f"{v:.1f}"), "#1d4ed8")
+        + _kpi_tile("Məbləğ", f"{st['total_amount']:,.0f} ₼", _trend_html(st["total_amount"], st["avg_amt"], lambda v: f"{v:,.0f} ₼"), "#7c3aed")
+        + _kpi_tile("Yüksək risk", f"{st['high_cnt']}", f'<span style="color:#64748b;">{money(st["high_amt"])}</span>', high_accent)
+        + _kpi_tile("Pasiyent / vizit", f"{st['patients']} / {st['visits']}", f'<span style="color:#64748b;">pik: {st["peak_hour"]:02d}:00–{(st["peak_hour"] + 1) % 24:02d}:00</span>', "#0891b2")
+    )
+    kpi_html = f'<table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin:0 -5px 6px;"><tr>{kpis}</tr></table>'
+
+    # --- Əsas müşahidələr ---
+    insights = "".join(f'<li style="margin-bottom:6px;">{x}</li>' for x in build_insights(df, st))
+    sec = 1
+    parts = [intro, kpi_html, _h3(sec, "Əsas Müşahidələr"),
+             f'<ul style="margin:0; padding-left:20px; font-size:13.5px; line-height:1.6; color:#334155;">{insights}</ul>']
+    sec += 1
+
+    # --- Ümumi mənzərə ---
+    pay = []
+    if st["paid_cnt"]:
+        pay.append(f"<b>{st['paid_cnt']}</b> ödənişli ({st['paid_cnt'] / st['total_ops']:.0%} — {money(st['paid_amt'])})")
+    if st["ins_cnt"]:
+        pay.append(f"<b>{st['ins_cnt']}</b> sığortalı ({st['ins_cnt'] / st['total_ops']:.0%} — {money(st['ins_amt'])})")
+    ops = df["Əməliyyat"].value_counts()
+    parts += [_h3(sec, "Ümumi Mənzərə"), f"""
+    <ul style="margin:0; padding-left:20px; font-size:13.5px; line-height:1.75; color:#334155;">
+      <li><b>Həcm:</b> cəmi <b>{st['total_ops']} xidmət</b> silinib/ləğv edilib — {st['patients']} pasiyent, {st['visits']} vizit; ümumi dəyər <b>{money(st['total_amount'])}</b>.</li>
+      <li><b>Əməliyyat növü:</b> {", ".join(f"{e(k)} — <b>{v}</b>" for k, v in ops.items())}.</li>
+      <li><b>Ödəniş növü:</b> {", ".join(pay)}.</li>
+    </ul>"""]
+    sec += 1
+
+    # --- Zaman fərqi kateqoriyaları ---
+    m = df["ferq_deqiqe"]
+    buckets = [
+        ("&lt; 10 dəqiqə", "Daxiletmə səhvi", m < 10, "#f0fdf4", "#86efac", "#16a34a", "#166534"),
+        ("10 dəq – 1 saat", "Operativ düzəliş", (m >= 10) & (m < 60), "#f8fafc", "#cbd5e1", "#475569", "#334155"),
+        ("1 – 24 saat", "Nəzarət tələb edir", (m >= 60) & (m < 1440), "#fffbeb", "#fcd34d", "#d97706", "#92400e"),
+        ("1 gündən çox", "Ən riskli qrup", m >= 1440, "#fef2f2", "#fca5a5", "#dc2626", "#991b1b"),
+    ]
+    cells = ""
+    active = [b for b in buckets if b[2].any()]
+    for label, desc, mask, bg, bd, top, fg in active:
+        cnt, amt = int(mask.sum()), float(df.loc[mask, "Məbləğ"].sum())
+        cells += f"""
+        <td width="{round(100 / len(active))}%" valign="top" style="padding:0 4px;">
+          <table width="100%" cellpadding="0" cellspacing="0" role="presentation"
+                 style="background:{bg}; border:1px solid {bd}; border-top:3px solid {top}; border-radius:6px;">
+            <tr><td align="center" style="padding:10px 6px; font-family:{FONT};">
+              <div style="font-size:11px; color:{fg}; font-weight:700;">{label}</div>
+              <div style="font-size:19px; font-weight:800; color:{fg}; margin:3px 0;">{cnt}</div>
+              <div style="font-size:11px; color:{fg};">{money(amt)}</div>
+              <div style="font-size:10.5px; color:#64748b; margin-top:2px;">{desc}</div>
+            </td></tr>
+          </table>
+        </td>"""
+    parts += [_h3(sec, "Silinməyə Qədər Keçən Vaxt"),
+              f'<table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin:0 -4px;"><tr>{cells}</tr></table>']
+    sec += 1
+
+    # --- Saatlıq paylanma ---
+    parts += [_h3(sec, "Saatlar Üzrə Paylanma"), _hour_bars(st)]
+    sec += 1
+
+    # --- Risk kartları ---
+    high_df, med_df = df[df["Risk səviyyəsi"] == LVL_HIGH], df[df["Risk səviyyəsi"] == LVL_MED]
+    if len(high_df):
+        parts += [_h3(sec, f"Yüksək Risk — {len(high_df)} əməliyyat, {money(high_df['Məbləğ'].sum())}", "#991b1b", "#dc2626"),
+                  '<p style="font-size:12.5px; color:#475569; margin:0 0 10px;">Göstərilmiş xidmətin gec silinməsi kassa itkisi və ya sənədsiz endirim riski yaradır:</p>',
+                  _risk_cards(high_df, MAX_CARDS_HIGH, "#dc2626", "#fee2e2", "#991b1b")]
+        sec += 1
+    if len(med_df):
+        parts += [_h3(sec, f"Orta Risk — {len(med_df)} əməliyyat, {money(med_df['Məbləğ'].sum())}", "#92400e", "#d97706"),
+                  _risk_cards(med_df, MAX_CARDS_MED, "#d97706", "#fef3c7", "#92400e")]
+        sec += 1
+
+    # --- Nəzarət xəbərdarlıqları ---
+    alerts = ""
+    if len(st["unknown"]):
+        u = st["unknown"]
+        alerts += _alert_box("⚠️ Nəzarət boşluğu: icraçı naməlum",
+                             f'"Silən istifadəçi" sahəsi {st["total_ops"]} əməliyyatın <b>{len(u)}-də ({len(u) / st["total_ops"]:.0%}) boşdur</b> '
+                             f"({money(u['Məbləğ'].sum())}). Audit izi tam deyil.",
+                             "#fff1f2", "#fecdd3", "#e11d48", "#881337")
+    if len(st["self_late"]):
+        s = st["self_late"]
+        who = s.groupby("Silən / Ləğv edən").size().sort_values(ascending=False)
+        names = ", ".join(f"{e(str(k))} ({v})" for k, v in who.head(4).items())
+        alerts += _alert_box("🔁 Vəzifə bölgüsü: əlavə edən özü silib",
+                             f"<b>{len(s)} xidmət</b> ({money(s['Məbləğ'].sum())}) onu sistemə daxil edən əməkdaş tərəfindən 1 saatdan gec silinib: {names}.",
+                             "#fffbeb", "#fde68a", "#d97706", "#78350f")
+    if len(st["anomaly"]):
+        alerts += _alert_box("🧩 Məlumat anomaliyası",
+                             f"<b>{len(st['anomaly'])} qeyddə</b> əməliyyat tarixi yaradılma tarixindən əvvəldir.",
+                             "#f5f3ff", "#ddd6fe", "#7c3aed", "#4c1d95")
+    if alerts:
+        parts += [_h3(sec, "Nəzarət Xəbərdarlıqları", "#9f1239", "#e11d48"), alerts]
+        sec += 1
+
+    # --- Ən çox silinən xidmətlər ---
+    ts_rows = "".join(
+        f'<tr style="background:{"#ffffff" if i % 2 == 0 else "#f8fafc"};">'
+        f'<td style="padding:8px 10px; border-bottom:1px solid #e2e8f0;">{e(str(r["Xidmət adı"]))}</td>'
+        f'<td align="center" style="padding:8px 10px; border-bottom:1px solid #e2e8f0;">{int(r["n"])}</td>'
+        f'<td align="right" style="padding:8px 10px; border-bottom:1px solid #e2e8f0; font-weight:700;">{money(r["amt"])}</td></tr>'
+        for i, r in st["top_services"].iterrows()
+    )
+    parts += [_h3(sec, "Ən Çox Silinən Xidmətlər (Top 5)"), f"""
+    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse; font-size:13px; border:1px solid #cbd5e1;">
+      <tr bgcolor="#1e3a8a" style="background:#1e3a8a; color:#ffffff;">
+        <th align="left" style="padding:9px 10px;">Xidmət</th><th style="padding:9px 10px;">Say</th><th align="right" style="padding:9px 10px;">Məbləğ</th></tr>
+      {ts_rows}
+    </table>"""]
+    sec += 1
+
+    # --- İstifadəçilər ---
+    u = st["users"]
+    has_high, has_med, has_self = st["high_cnt"] > 0, st["med_cnt"] > 0, len(st["self_late"]) > 0
+    th = lambda t, a="center": f'<th align="{a}" style="padding:9px 10px;">{t}</th>'  # noqa: E731
+    head = th("Əməkdaş", "left") + th("Cəmi") + (th("Yüksək") if has_high else "") + (th("Orta") if has_med else "") \
+        + (th("Özü sildi") if has_self else "") + th("Median gecikmə") + th("Məbləğ", "right")
+    rows = ""
+    for i, r in u.iterrows():
+        bg = "#ffffff" if i % 2 == 0 else "#f8fafc"
+        td = lambda v, extra="": f'<td align="center" style="padding:8px 10px; border-bottom:1px solid #e2e8f0;{extra}">{v}</td>'  # noqa: E731
+        name_color = "#be123c" if r["Silən / Ləğv edən"] == UNKNOWN_USER else "#1e293b"
+        rows += (f'<tr style="background:{bg};"><td style="padding:8px 10px; border-bottom:1px solid #e2e8f0; font-weight:600; color:{name_color};">{e(str(r["Silən / Ləğv edən"]))}</td>'
+                 + td(int(r["cnt"]))
+                 + (td(int(r["high"]) or "—", " color:#b91c1c; font-weight:700;") if has_high else "")
+                 + (td(int(r["med"]) or "—", " color:#b45309; font-weight:600;") if has_med else "")
+                 + (td(int(r["self_late"]) or "—", " color:#92400e;") if has_self else "")
+                 + td(format_duration(r["avg_delay"]), " color:#64748b;")
+                 + f'<td align="right" style="padding:8px 10px; border-bottom:1px solid #e2e8f0; font-weight:700; color:#0f172a; white-space:nowrap;">{money(r["amt"])}</td></tr>')
+    parts += [_h3(sec, "İstifadəçilər Üzrə İcmal"), f"""
+    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse; font-size:13px; border:1px solid #cbd5e1;">
+      <tr bgcolor="#1e3a8a" style="background:#1e3a8a; color:#ffffff;">{head}</tr>{rows}
+    </table>
+    <p style="font-size:11.5px; color:#64748b; margin:16px 0 0; line-height:1.6;">
+      * Bütün sətirlər risk balı, səbəbi və gecikmə müddəti ilə əlavə olunmuş <b>Excel</b> faylındadır (İcmal · Detallar · İstifadəçilər).<br>
+      * Risk balı (0–100): gecikmə, ödəniş növü, məbləğ, icraçının özü silməsi, naməlum icraçı və iş saatından kənar əməliyyat əsasında hesablanır.
+      Yüksək ≥ {SCORE_HIGH}, Orta ≥ {SCORE_MED}, Aşağı ≥ {SCORE_LOW}. Məbləğ = Qiymət × Say.
+    </p>"""]
+
+    preheader = (f"{st['total_ops']} əməliyyat, {money(st['total_amount'])}"
+                 + (f" · {st['high_cnt']} yüksək risk" if st["high_cnt"] else " · yüksək risk yoxdur"))
+    return _shell(report_date, preheader, "Silinən və Ləğv Edilən Xidmətlərin Risk Təhlili", "".join(parts))
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  GÖNDƏRİŞ
+# ═══════════════════════════════════════════════════════════════════
+def smtp_send(msg: EmailMessage) -> None:
+    if not SENDER_PASSWORD:
+        raise RuntimeError("SENDER_PASSWORD boşdur.")
+    last_err = None
+    for attempt in range(1, SMTP_RETRIES + 1):
+        try:
+            with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=30) as server:
+                server.starttls()
+                server.login(SENDER_EMAIL, SENDER_PASSWORD)
+                server.send_message(msg)
+            return
+        except (smtplib.SMTPException, OSError) as err:
+            last_err = err
+            logging.warning(f"SMTP cəhdi {attempt}/{SMTP_RETRIES} uğursuz: {err}")
+            if attempt < SMTP_RETRIES:
+                time.sleep(10 * attempt)
+    raise RuntimeError(f"Email {SMTP_RETRIES} cəhddən sonra göndərilmədi") from last_err
+
+
+def send_failure_alert(report_date: str, err: Exception) -> None:
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = f"❌ XƏTA: Silinən xidmətlər hesabatı göndərilmədi ({report_date})"
+        msg["From"] = formataddr((SENDER_NAME, SENDER_EMAIL))
+        msg["To"] = ", ".join(ALERT_EMAIL)
+        msg.set_content(f"Hesabat {report_date} üçün yaradıla bilmədi.\n\nXəta: {err!r}\n\nƏtraflı: {LOG_FILE}")
+        smtp_send(msg)
+        logging.info("Xəta bildirişi göndərildi.")
+    except Exception as alert_err:  # noqa: BLE001
+        logging.error(f"Xəta bildirişi də göndərilə bilmədi: {alert_err}")
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  ƏSAS AXIN
+# ═══════════════════════════════════════════════════════════════════
+def run(report_day: date, dry_run: bool, demo: bool, receivers: list[str]) -> None:
+    report_date = report_day.strftime("%d.%m.%Y")
+    start = datetime.combine(report_day - timedelta(days=TREND_DAYS), datetime.min.time())
+    end = datetime.combine(report_day + timedelta(days=1), datetime.min.time())
+
+    logging.info(f"Hesabat günü: {report_date} | trend aralığı: {start:%d.%m} – {report_day:%d.%m} | "
+                 f"{'DEMO' if demo else 'FONET'}{' | DRY-RUN' if dry_run else ''}")
+
+    raw = demo_data(report_day) if demo else fetch_data(start, end)
+    full = enrich_dataframe(raw)
+    if full.empty:
+        df, hist = full, full
+    else:
+        df = full[full["gun"] == report_day].reset_index(drop=True)
+        hist = full[full["gun"] != report_day]
+
+    st = compute_stats(df, hist, report_day)
+    html_body = build_executive_html(df, st, report_date)
+    xlsx = build_excel(df, st, report_date) if len(df) else None
+    xlsx_name = f"Risk_Analizi_Silinen_Xidmetler_{report_day:%Y-%m-%d}.xlsx"
+
+    if len(df):
+        logging.info(f"{len(df)} əməliyyat | {money(st['total_amount'])} | yüksək: {st['high_cnt']} | orta: {st['med_cnt']}")
+    else:
+        logging.info("Hesabat günündə silinmə yoxdur.")
+
+    if dry_run:
+        os.makedirs(OUT_DIR, exist_ok=True)
+        html_path = os.path.join(OUT_DIR, f"preview_{report_day:%Y-%m-%d}.html")
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(html_body)
+        logging.info(f"HTML önizləmə: {html_path}")
+        if xlsx:
+            with open(os.path.join(OUT_DIR, xlsx_name), "wb") as f:
+                f.write(xlsx)
+            logging.info(f"Excel: {os.path.join(OUT_DIR, xlsx_name)}")
+        return
+
+    msg = EmailMessage()
+    msg["Subject"] = f"IMC filialı üzrə ({report_date}) xidmət silinməsi və ləğv hesabatı — Risk analizləri ilə birlikdə"
+    msg["From"] = formataddr((SENDER_NAME, SENDER_EMAIL))
+    msg["To"] = ", ".join(receivers)
+    if CC_EMAIL:
+        msg["Cc"] = ", ".join(CC_EMAIL)
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid(domain=SENDER_EMAIL.split("@")[-1])
+    msg.set_content(
+        f"Hörmətli Rəhbərlik,\n\n{report_date} tarixində baş vermiş xidmət silinmələri və ləğv əməliyyatları üzrə "
+        f"risk hesabatı əlavə olunur.\n\n"
+        + (f"Cəmi: {st['total_ops']} əməliyyat, {money(st['total_amount'])}\n"
+           f"Yüksək risk: {st['high_cnt']} | Orta risk: {st['med_cnt']}\n" if len(df) else "Silinmə qeydə alınmayıb.\n")
+    )
+    msg.add_alternative(html_body, subtype="html")
+    if xlsx:
+        msg.add_attachment(xlsx, maintype="application",
+                           subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet", filename=xlsx_name)
+
+    logging.info("SMTP serverə qoşulur...")
+    smtp_send(msg)
+    logging.info(f"Risk məruzəsi göndərildi ({report_date}) -> {', '.join(receivers + CC_EMAIL)}")
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  CƏDVƏL — hər gün SEND_HOUR:SEND_MINUTE (Bakı vaxtı) dünən üzrə hesabat
+# ═══════════════════════════════════════════════════════════════════
+def baku_now() -> datetime:
+    return datetime.now(TIMEZONE)
+
+
+def read_last_sent() -> date | None:
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            return datetime.strptime(f.read().strip(), "%Y-%m-%d").date()
+    except (OSError, ValueError):
+        return None
+
+
+def write_last_sent(d: date) -> None:
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(d.isoformat())
+    os.replace(tmp, STATE_FILE)
+
+
+def run_scheduler() -> None:
+    """
+    Daimi işləyən rejim (systemd service üçün).
+    • Hər gün 12:00-da dünən üzrə hesabat göndərilir.
+    • Servis 12:00-dan sonra yenidən başladılarsa və həmin günün hesabatı hələ
+      göndərilməyibsə, dərhal göndərilir. Artıq göndərilibsə, təkrar getmir (.last_sent).
+    • Xəta olarsa RETRY_EVERY_MIN dəqiqədən bir, gündə ən çox MAX_DAILY_ATTEMPTS dəfə cəhd edilir;
+      son cəhd də uğursuz olarsa ALERT_EMAIL-ə xəta bildirişi gedir.
+    """
+    logging.info(f"Planlayıcı işə düşdü: hər gün {SEND_HOUR:02d}:{SEND_MINUTE:02d} (Asia/Baku) -> "
+                 f"{', '.join(RECEIVER_EMAIL)}")
+    attempts: dict[date, int] = {}
+    next_try: datetime | None = None
+    announced: date | None = None
+
+    while True:
+        now = baku_now()
+        report_day = now.date() - timedelta(days=1)
+        send_at = now.replace(hour=SEND_HOUR, minute=SEND_MINUTE, second=0, microsecond=0)
+        done = read_last_sent() == report_day
+        tries = attempts.get(report_day, 0)
+
+        if (not done and now >= send_at and tries < MAX_DAILY_ATTEMPTS
+                and (next_try is None or now >= next_try)):
+            attempts[report_day] = tries + 1
+            logging.info(f"Göndəriş cəhdi {tries + 1}/{MAX_DAILY_ATTEMPTS} — hesabat günü {report_day:%d.%m.%Y}")
+            try:
+                run(report_day, dry_run=False, demo=False, receivers=RECEIVER_EMAIL)
+                write_last_sent(report_day)
+                next_try = None
+            except Exception as err:  # noqa: BLE001
+                logging.error(f"Göndəriş uğursuz oldu: {err}", exc_info=True)
+                if tries + 1 >= MAX_DAILY_ATTEMPTS:
+                    send_failure_alert(report_day.strftime("%d.%m.%Y"), err)
+                    next_try = None
+                else:
+                    next_try = baku_now() + timedelta(minutes=RETRY_EVERY_MIN)
+                    logging.info(f"Növbəti cəhd: {next_try:%H:%M}")
+            continue
+
+        # Növbəti göndəriş vaxtını bir dəfə loga yaz
+        nxt = send_at if now < send_at else send_at + timedelta(days=1)
+        if announced != nxt.date():
+            logging.info(f"Növbəti hesabat: {nxt:%d.%m.%Y %H:%M} ({(nxt - timedelta(days=1)):%d.%m.%Y} üzrə)")
+            announced = nxt.date()
+
+        # Uzun yuxu əvəzinə ən çox 60 san — saat dəyişikliyi / server yuxusu təhlükəsiz olsun
+        target = next_try if (next_try and not done) else nxt
+        time.sleep(max(1.0, min(60.0, (target - baku_now()).total_seconds())))
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="FONET silinən/ləğv edilən xidmətlər üzrə risk məruzəsi")
+    p.add_argument("--once", action="store_true", help="Planlayıcısız, dərhal bir dəfə göndər (dünən üzrə)")
+    p.add_argument("--date", help="Hesabat günü (YYYY-MM-DD) — dərhal bir dəfə göndərir")
+    p.add_argument("--dry-run", action="store_true", help="Email göndərmə, ./out/ qovluğuna yaz")
+    p.add_argument("--demo", action="store_true", help="Bazaya qoşulma, nümunə məlumat istifadə et")
+    p.add_argument("--to", help="Alıcıları müvəqqəti əvəzlə (vergüllə)")
+    args = p.parse_args()
+
+    setup_logging()
+
+    # Heç bir parametr yoxdursa — daimi planlayıcı rejimi (systemd)
+    if not (args.once or args.date or args.dry_run or args.demo or args.to):
+        try:
+            run_scheduler()
+        except KeyboardInterrupt:
+            logging.info("Planlayıcı dayandırıldı.")
+        return 0
+
+    report_day = (datetime.strptime(args.date, "%Y-%m-%d").date() if args.date
+                  else baku_now().date() - timedelta(days=1))
+    receivers = [x.strip() for x in args.to.split(",")] if args.to else RECEIVER_EMAIL
+
+    try:
+        run(report_day, args.dry_run, args.demo, receivers)
+        return 0
+    except Exception as err:  # noqa: BLE001
+        logging.error(f"Xəta baş verdi: {err}", exc_info=True)
+        if not args.dry_run:
+            send_failure_alert(report_day.strftime("%d.%m.%Y"), err)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
