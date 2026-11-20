@@ -1,0 +1,2894 @@
+# -*- coding: utf-8 -*-
+"""
+FİLİALLAR ÜZRƏ ŞÖBƏ FƏALİYYƏT VƏ SATIŞ HESABATI
+Pediatriya · Neonatologiya · TTY · Fizioterapiya  (Babək, Mərkəz, Medilux)
+FONET HBYS (Oracle)  →  Excel: Rəhbərlik paneli + detallı vərəqlər + məlumat keyfiyyəti yoxlamaları
+
+İstifadə:
+    python filial_fealiyyet_hesabati.py                                # default dövr (aşağıda)
+    python filial_fealiyyet_hesabati.py --start 20.08.2026 --end 19.11.2026
+    python filial_fealiyyet_hesabati.py --demo                         # bazasız, nümunə məlumatla dizayn yoxlaması
+    python filial_fealiyyet_hesabati.py --sec                          # işə salanda şöbə seçimi menyusu
+    python filial_fealiyyet_hesabati.py --bolme "Pediatriya,Neonatologiya"   # standart bölmələrdən seçim
+    python filial_fealiyyet_hesabati.py --sobe "Reanimasiya; Kardiologiya"   # istənilən şöbə(lər), hər biri ayrıca bölmə
+
+Giriş məlumatları:
+    FONET_DB_USER / FONET_DB_PASS mühit dəyişənləri (parol yoxdursa, işə salanda soruşulur).
+    Parolu skriptin içində saxlamayın.
+"""
+
+import argparse
+from collections import defaultdict
+import getpass
+import os
+import re
+import sys
+import time
+from datetime import datetime, date, timedelta
+
+import numpy as np
+import pandas as pd
+from openpyxl import Workbook
+from openpyxl.chart import BarChart, LineChart, Reference
+from openpyxl.chart.label import DataLabelList
+from openpyxl.formatting.rule import ColorScaleRule, DataBarRule, FormulaRule
+from openpyxl.styles import Alignment, Border, Font, GradientFill, PatternFill, Side
+from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.pagebreak import Break
+from openpyxl.workbook.defined_name import DefinedName
+from openpyxl.worksheet.datavalidation import DataValidation
+
+# =====================================================================================
+# 1. KONFİQURASİYA
+# =====================================================================================
+ORACLE_CLIENT_DIR = r"C:\instant\instantclient_23_9"
+DB_USER = os.environ.get("FONET_DB_USER", "NURAN")
+
+# Default hesabat dövrü: son 3 TAM ay — bu gün daxil deyil (bitməmiş gün rəqəmləri dəyişdirir).
+#   Məs. 20.11.2026 işə salınanda: 20.08.2026 – 19.11.2026 (SQL-də: >= 20.08 AND < 20.11)
+# Başqa dövr üçün: --start DD.MM.YYYY --end DD.MM.YYYY (hər iki tarix DAXİL)
+DEFAULT_MONTHS = 3
+
+# Ödəniş növünün təyini (pasiyent sinfi və ya təşkilatın adı üzrə, böyük hərflə).
+# Sinif adları filiallarda fərqlidir: "Sigorta Xəstələri", "Sığortalı pasientlər", "Sigorta Hastalari",
+# "İcabri tibbi sığorta" — ona görə dəqiq ad yox, açar söz istifadə olunur.
+PAY_ITS_KEYS = ["CBAR", "CABR"]                              # İcbari / İcabri tibbi sığorta
+PAY_SIG_KEYS = ["SIGORT", "SIĞORT", "SİGORT", "SİĞORT"]      # könüllü tibbi sığorta
+PAY_LABEL = {"NAGD": "Nağd (pasiyent)", "SIG": "Sığorta", "ITS": "İcbari tibbi sığorta", "KORP": "Korporativ / digər"}
+
+PREPARED_BY = "Nuran Həsənov, Analitika və Hesabatlılıq şöbəsi"
+
+# Lazım olarsa, xidmət sətirlərinə əlavə filtr (məs. silinmiş/ləğv edilmiş xidmətləri çıxarmaq üçün):
+#   EXTRA_HIZMET_FILTER = "AND T.HI_DURUM = '+'"
+EXTRA_HIZMET_FILTER = ""
+
+# Bölmə qrupları — kodlar SQL-də ASCII saxlanılır, adlar yalnız Excel-də göstərilir
+GROUPS = [
+    ("PED", "Pediatriya"),
+    ("NEO", "Neonatologiya"),
+    ("TTY", "TTY (Təcili Tibbi Yardım)"),
+    ("FIZ", "Fizioterapiya"),
+]
+GROUP_LABEL = dict(GROUPS)
+GROUP_ORDER = [g for g, _ in GROUPS]
+TOTAL_LABEL = "Filial cəmi"
+
+# Şöbə → qrup bağlantısı AÇIQ şəkildə verilir (açar söz axtarışı Azərbaycan hərflərində səhv işləyirdi)
+BRANCHES = {
+    "Babək": {
+        "dsn": "172.18.79.23:1521/FONETAZ",
+        "groups": {
+            "PED": ["Pediatriya", "Pediatriya-1-", "Pediatriya-2-", "Pediatriya Stasionar",
+                    "Pediatriya Reanimasiya", "Pediatriya Müşahidə otağı", "Pediatriya Qan alma", "PEYVƏND"],
+            "NEO": ["Neonatologiya", "Yeni Doğulmuşlar Şöbəsi", "Yeni Doğulmuşlar Fiziolojik Şöbəsi",
+                    "Yeni Doğulmuşlar Reanimasiya Şöbəsi"],
+            "TTY": ["Təcili Yardım", "Təcili Yardım Çağrışı", "Təcili yardım VIP", "Manipulyasiyalar"],
+            "FIZ": ["Fizioterapiya", "Fizioterapiya xidmətləri"],
+        },
+        "depots": {
+            "PED": ["Pediatriya Reanimasiya Dərman Deposu", "Pediatriya  Teserrufat", "Pediatriya Reanimasiya Tes.",
+                    "Pediatriya Reanimasiya Təsərrüfat Deposu", "Pediatrik Reanimasiya Təsərrüffat deposu",
+                    "Pediatriya stasionar Təsərrüfat deposu"],
+            "NEO": ["Neontologiya Teserrufat", "Neonatologiya təsərrüfat deposu"],
+            "TTY": ["Tecili Yardim Teserrufat", "Təcilli yardım Təsərrüffat deposu"],
+        },
+    },
+    "Mərkəz": {
+        "dsn": "10.20.0.10:1521/FONETAZ",
+        "groups": {
+            "PED": ["Pediatr", "Pediatr Qabil Mürsəlov", "Pediatr ( Qabil Mürsəlov )", "Pediatr Cərrah", "Peyvend",
+                    "Uşaq Cərrahiyəsi"],
+            "NEO": ["Neonatologiya", "Neonatoloji", "YENI DOGULMUS"],
+            "TTY": ["TECILI YARDIM"],
+            "FIZ": ["Fizioterapiya Anar Nəbiyev"],
+        },
+        # Bölmələrin dərman və təsərrüfat (sərf materialı) depoları. Cihaz/inventar depoları daxil deyil (əsas vəsait).
+        "depots": {
+            "TTY": ["Təcili yardim teserrufat deposu"],
+            "NEO": ["Yenidogulmus Tes."],
+        },
+    },
+    "Medilux": {
+        "dsn": "172.18.48.118:1521/FONETAZ",
+        "groups": {
+            "PED": ["PEDİATR", "Pediatriya Stasionar", "PEdiatriya Reanimasiya", "PEDİATRİYA MÜŞAHİDƏ ŞÖBƏSİ",
+                    "PEDİATRİYA 4001", "PEDİATRİYA-NƏRGİZ", "PEYVƏND", "QAN ALMA (PEDIATRIYA)"],
+            "NEO": ["NEONTOLOGİYA FİZİOLOJİ", "NEONTOLOGİYA REANİMASİYA", "HƏKİM OTAĞI NEONATOLOGİYA"],
+            "TTY": ["TƏCİLİ TİBBİ YARDIM", "Təcili yardım"],
+        },
+        "depots": {
+            "PED": ["Pediatriya Stassionar Tes."],
+            "NEO": ["NEONTOLOGİYA TƏSƏRRÜFAT"],
+        },
+    },
+}
+BRANCH_ORDER = list(BRANCHES.keys())
+
+# Hesabata daxil edilməmiş, amma adı oxşar olan şöbələri tutmaq üçün açar sözlər (yalnız yoxlama məqsədli)
+MISSED_DEPT_EXCLUDE = ["ORTOPED", "GINEKOL", "GİNEKOL", "KARDIOMAN", "KARDİOMAN", "TESERRUF", "TƏSƏRRÜF",
+                       "DEPO", "ANBAR", "KASSA"]
+MISSED_DEPT_PATTERNS = ["PED", "PEYV", "NEON", "NEONT", "YENI DO", "YENİ DO", "TƏCIL", "TƏCİL",
+                        "TECIL", "TECİL", "MANIP", "MANİP", "FIZIO", "FİZİO"]
+
+# Şöbə deposundan "digər çıxışlar"ın (çıxış növü 3) istiqamətə görə təsnifatı (ad üzrə açar sözlər, böyük hərflə)
+DRUG_CORP_KEYS = ["MƏNTƏQ", "MENTEQ", "YATAĞ", "YATAG", "LAHIY", "KORPERAT", "KORPORAT", "PMD", "AMBULANS",
+                  "SAIPEM", "ST CLINIC", "XAZAR", "GƏMI", "GEMI"]
+DRUG_INV_KEYS = ["INVENTAR", "ENVANTER", "CIHAZ", "DEMIRBAŞ", "DEMIRBAS"]
+DRUG_WASTE_KEYS = ["TULLANT", "TULANT", "ATIQ", "IMHA", "SILIN", "ZAY"]   # yazılış fərqləri də daxil
+DRUG_DEPOT_KEYS = ["DEPO", "ANBAR", "AMBAR", "TƏSƏRRÜF", "TESERRUF", "TƏSƏRRUF", "APTEK", "ECZANE"]
+
+AZ_MONTHS = ["Yanvar", "Fevral", "Mart", "Aprel", "May", "İyun", "İyul", "Avqust",
+             "Sentyabr", "Oktyabr", "Noyabr", "Dekabr"]
+
+# =====================================================================================
+# 2. SQL QURUCULARI
+# =====================================================================================
+AMT = "(NVL(T.HI_HTUTAR, 0) + NVL(T.HI_KTUTAR, 0))"
+NAGD = "NVL(T.HI_HTUTAR, 0)"
+
+
+def pay_case(sinif_col, kurum_col=None):
+    """SQL: qurum payının növü — 'ITS' / 'SIG' / 'KORP' (sinif və ya təşkilat adı üzrə)."""
+    cols = [c for c in (sinif_col, kurum_col) if c]
+    like = lambda keys: " OR ".join(f"UPPER(NVL({c}, '-')) LIKE '%{k}%'" for c in cols for k in keys)
+    return f"(CASE WHEN {like(PAY_ITS_KEYS)} THEN 'ITS' WHEN {like(PAY_SIG_KEYS)} THEN 'SIG' ELSE 'KORP' END)"
+
+
+def pay_class(sinif, kurum=None):
+    """Python ekvivalenti (demo və yoxlama üçün)."""
+    u = (str(sinif or "-") + "|" + str(kurum or "-")).upper()
+    if any(k in u for k in PAY_ITS_KEYS):
+        return "ITS"
+    if any(k in u for k in PAY_SIG_KEYS):
+        return "SIG"
+    return "KORP"
+PERIOD_T = f"T.HI_TARIH >= :start_dt AND T.HI_TARIH < :end_dt {EXTRA_HIZMET_FILTER}"
+
+
+def sql_list(names):
+    return ", ".join("'" + n.replace("'", "''") + "'" for n in names)
+
+
+def all_depts(cfg):
+    return [d for ds in cfg["groups"].values() for d in ds]
+
+
+def drug_names(cfg):
+    return all_depts(cfg) + [d for ds in cfg.get("depots", {}).values() for d in ds]
+
+
+def name_to_group(cfg):
+    m = {d: g for g, ds in cfg["groups"].items() for d in ds}
+    m.update({d: g for g, ds in cfg.get("depots", {}).items() for d in ds})
+    return m
+
+
+def group_case(col, cfg):
+    whens = " ".join(f"WHEN {col} IN ({sql_list(ds)}) THEN '{g}'" for g, ds in cfg["groups"].items() if ds)
+    return f"CAST(CASE {whens} ELSE 'XXX' END AS VARCHAR2(10))"
+
+
+# Həkim qazancı (hakediş) view-unda həkim sütununun mümkün adları — skript bazada hansının olduğunu özü tapır
+HAK_CODE_CANDIDATES = ["PERSKODU", "HAK_PERSKODU", "HAKPERSKODU", "PERS_KODU", "P_KODU", "DR_KODU", "DRKODU",
+                       "DOKTORKODU", "DOKTOR_KODU", "HEKIMKODU"]
+HAK_NAME_CANDIDATES = ["PERSADI", "HAK_PERSADI", "HAKPERSADI", "PERS_ADI", "DR_ADI", "DRADI", "DOKTORADI",
+                       "DOKTOR_ADI", "P_ADSOYAD", "ADSOYAD", "HEKIMADI"]
+
+
+def build_queries(cfg, use_kurum=True, hak=None):
+    IN = sql_list(all_depts(cfg))
+    KUR = "T.HKURUMADI" if use_kurum else None
+    PAYX = pay_case("T.HSINIFADI", KUR)
+    SIG = f"CASE WHEN {PAYX} = 'SIG' THEN NVL(T.HI_KTUTAR, 0) ELSE 0 END"
+    ITS = f"CASE WHEN {PAYX} = 'ITS' THEN NVL(T.HI_KTUTAR, 0) ELSE 0 END"
+    KORP = f"CASE WHEN {PAYX} = 'KORP' THEN NVL(T.HI_KTUTAR, 0) ELSE 0 END"
+    G_T = group_case("T.SR_ADI", cfg)
+    G_Y = group_case("Y.SERVISADI", cfg)
+    G_IS = group_case("T.ISERVIS", cfg)
+    Q = {}
+
+    # --- A. Əsas göstəricilər: 3 səviyyədə (S=şöbə, Q=bölmə qrupu, F=filial cəmi) ------------------
+    # COUNT(DISTINCT) hər səviyyədə AYRICA hesablanır — şöbə rəqəmlərini toplamaq səhv nəticə verirdi.
+    Q["met"] = f"""
+    WITH XB AS (
+        SELECT /*+ MATERIALIZE */
+               T.SR_ADI, {G_T} AS QRUP, T.HK_ID, T.HK_KAYITKODU, T.HK_HASTATURU, T.PERSKODU,
+               {PAYX} AS PAY, NVL(T.HI_HTUTAR, 0) AS H_TUTAR, NVL(T.HI_KTUTAR, 0) AS K_TUTAR
+        FROM fonethbys.V_IST_GENEL_HIZMET T
+        WHERE {PERIOD_T}
+          AND T.SR_ADI IN ({IN})
+    ),
+    XL AS (
+        SELECT 'S' AS SEVIYYE, QRUP, CAST(SR_ADI AS VARCHAR2(200)) AS OBYEKT,
+               HK_ID, HK_KAYITKODU, HK_HASTATURU, PERSKODU, PAY, H_TUTAR, K_TUTAR FROM XB
+        UNION ALL
+        SELECT 'Q', QRUP, CAST(QRUP AS VARCHAR2(200)),
+               HK_ID, HK_KAYITKODU, HK_HASTATURU, PERSKODU, PAY, H_TUTAR, K_TUTAR FROM XB
+        UNION ALL
+        SELECT 'F', CAST('ALL' AS VARCHAR2(10)), CAST('ALL' AS VARCHAR2(200)),
+               HK_ID, HK_KAYITKODU, HK_HASTATURU, PERSKODU, PAY, H_TUTAR, K_TUTAR FROM XB
+    ),
+    ADM AS (SELECT DISTINCT HK_ID, HK_KAYITKODU FROM XB),
+    ILK AS (
+        -- Pasiyentin (HK_KAYITKODU) filialdakı ilk aktiv müraciəti
+        SELECT K.HK_KAYITKODU,
+               MIN(K.HK_ID) KEEP (DENSE_RANK FIRST ORDER BY K.HK_MURACAATTAR, K.HK_ID) AS ILK_HK_ID
+        FROM fonethbys.H_HASTAKAYIT K
+        WHERE K.HK_DURUM = '+'
+          AND K.HK_KAYITKODU IN (SELECT HK_KAYITKODU FROM ADM)
+        GROUP BY K.HK_KAYITKODU
+    ),
+    ADM_FLAG AS (
+        SELECT A.HK_ID,
+               CASE WHEN I.ILK_HK_ID IS NULL OR I.ILK_HK_ID = A.HK_ID THEN 1 ELSE 0 END AS YENI
+        FROM ADM A LEFT JOIN ILK I ON I.HK_KAYITKODU = A.HK_KAYITKODU
+    ),
+    MET AS (
+        SELECT L.SEVIYYE, L.OBYEKT, MAX(L.QRUP) AS QRUP,
+               COUNT(DISTINCT CASE WHEN L.HK_HASTATURU LIKE 'A%' THEN L.HK_ID END) AS AMB_QEBUL,
+               COUNT(DISTINCT CASE WHEN L.HK_HASTATURU LIKE 'Y%' THEN L.HK_ID END) AS STAS_QEBUL,
+               COUNT(DISTINCT L.HK_ID)                                      AS CEMI_QEBUL,
+               COUNT(DISTINCT CASE WHEN F.YENI = 1 THEN L.HK_ID END)        AS YENI_QEBUL,
+               COUNT(DISTINCT CASE WHEN F.YENI = 0 THEN L.HK_ID END)        AS TEKRAR_QEBUL,
+               COUNT(DISTINCT L.HK_KAYITKODU)                               AS UNIKAL_PASIYENT,
+               COUNT(DISTINCT L.PERSKODU)                                   AS HEKIM_SAYI,
+               COUNT(*)                                                     AS XIDMET_SATIRI,
+               SUM(L.H_TUTAR + L.K_TUTAR)                                   AS SATIS,
+               SUM(L.H_TUTAR)                                               AS NAGD,
+               SUM(CASE WHEN L.PAY = 'SIG' THEN L.K_TUTAR ELSE 0 END)   AS SIGORTA,
+               SUM(CASE WHEN L.PAY = 'ITS' THEN L.K_TUTAR ELSE 0 END)   AS ITS,
+               SUM(CASE WHEN L.PAY = 'KORP' THEN L.K_TUTAR ELSE 0 END)  AS KORPORATIV
+        FROM XL L
+        JOIN ADM_FLAG F ON F.HK_ID = L.HK_ID
+        GROUP BY L.SEVIYYE, L.OBYEKT
+    ),
+    YB AS (
+        SELECT /*+ MATERIALIZE */
+               Y.SERVISADI AS SR_ADI, {G_Y} AS QRUP, Y.HK_ID,
+               TRUNC(Y.TARIH) AS GIRIS, TRUNC(Y.CIKISTARIHI) AS CIKIS
+        FROM fonethbys.V_YH_DEFTER Y
+        WHERE Y.TARIH >= :start_dt AND Y.TARIH < :end_dt
+          AND Y.SERVISADI IN ({IN})
+    ),
+    YL AS (
+        SELECT 'S' AS SEVIYYE, CAST(SR_ADI AS VARCHAR2(200)) AS OBYEKT, HK_ID, GIRIS, CIKIS FROM YB
+        UNION ALL SELECT 'Q', CAST(QRUP AS VARCHAR2(200)), HK_ID, GIRIS, CIKIS FROM YB
+        UNION ALL SELECT 'F', CAST('ALL' AS VARCHAR2(200)), HK_ID, GIRIS, CIKIS FROM YB
+    ),
+    YK AS (
+        -- Hər yatış kartı (HK_ID) hər səviyyədə 1 dəfə: şöbələrarası keçid (Reanimasiya → Stasionar) bir yatışdır
+        SELECT SEVIYYE, OBYEKT, HK_ID, MIN(GIRIS) AS GIRIS, MAX(CIKIS) AS CIKIS,
+               MAX(CASE WHEN CIKIS IS NULL THEN 1 ELSE 0 END) AS ACIQ
+        FROM YL GROUP BY SEVIYYE, OBYEKT, HK_ID
+    ),
+    YAT AS (
+        SELECT SEVIYYE, OBYEKT,
+               COUNT(*)      AS HOSP_SAYI,
+               SUM(1 - ACIQ) AS TAXIS_SAYI,
+               SUM(ACIQ)     AS HELE_YATAN,
+               -- Orta yatış yalnız evə yazılmış pasiyentlər üzrə; eyni gün çıxış = 1 çarpayı-günü
+               AVG(CASE WHEN ACIQ = 0 THEN GREATEST(CIKIS - GIRIS, 1) END) AS ORTA_YATIS
+        FROM YK GROUP BY SEVIYYE, OBYEKT
+    )
+    SELECT M.SEVIYYE, M.QRUP, M.OBYEKT,
+           M.AMB_QEBUL, M.STAS_QEBUL, M.CEMI_QEBUL, M.YENI_QEBUL, M.TEKRAR_QEBUL, M.UNIKAL_PASIYENT,
+           M.HEKIM_SAYI, M.XIDMET_SATIRI, M.SATIS, M.NAGD, M.SIGORTA, M.ITS, M.KORPORATIV,
+           NVL(Y.HOSP_SAYI, 0) AS HOSP_SAYI, NVL(Y.TAXIS_SAYI, 0) AS TAXIS_SAYI,
+           NVL(Y.HELE_YATAN, 0) AS HELE_YATAN, Y.ORTA_YATIS
+    FROM MET M
+    LEFT JOIN YAT Y ON Y.SEVIYYE = M.SEVIYYE AND Y.OBYEKT = M.OBYEKT
+    """
+
+    # --- B. Həkimlər (həkimi qeyd olunmayan sətirlər də ayrıca sətir kimi qalır — məbləğ itmir) ------
+    Q["hekim"] = f"""
+    SELECT T.SR_ADI, MAX({G_T}) AS QRUP, T.PERSKODU, MAX(T.PERSADI) AS PERSADI,
+           COUNT(DISTINCT T.HK_ID) AS CEMI_QEBUL, COUNT(DISTINCT T.HK_KAYITKODU) AS UNIKAL_PASIYENT,
+           COUNT(*) AS XIDMET_SATIRI,
+           SUM({AMT}) AS SATIS, SUM({NAGD}) AS NAGD, SUM({SIG}) AS SIGORTA, SUM({ITS}) AS ITS,
+           SUM({KORP}) AS KORPORATIV
+    FROM fonethbys.V_IST_GENEL_HIZMET T
+    WHERE {PERIOD_T}
+      AND T.SR_ADI IN ({IN})
+    GROUP BY T.SR_ADI, T.PERSKODU
+    """
+
+    # --- C. Aylıq dinamika (qrup + filial cəmi; distinct sayı GROUPING SETS ilə düzgün) -------------
+    Q["ay"] = f"""
+    SELECT CASE WHEN GROUPING(QRUP) = 1 THEN 'ALL' ELSE QRUP END AS QRUP, AY,
+           COUNT(DISTINCT HK_ID) AS CEMI_QEBUL, SUM(MEBLEG) AS SATIS
+    FROM (
+        SELECT {G_T} AS QRUP, TRUNC(T.HI_TARIH, 'MM') AS AY, T.HK_ID, {AMT} AS MEBLEG
+        FROM fonethbys.V_IST_GENEL_HIZMET T
+        WHERE {PERIOD_T}
+          AND T.SR_ADI IN ({IN})
+    )
+    GROUP BY GROUPING SETS ((QRUP, AY), (AY))
+    """
+
+    # --- D. Göndərilən yönləndirmələr: yalnız hesabatdan KƏNAR icraçı şöbələrə -----------------------
+    # (Pediatriya → PEYVƏND kimi daxili keçidlər onsuz da İcmal vərəqindədir; burada təkrar sayılmır)
+    Q["geden"] = f"""
+    SELECT T.ISERVIS AS GONDEREN_SOBE, MAX({G_IS}) AS QRUP, T.SR_ADI AS ICRACI_SOBE,
+           T.ITU_ADI, T.IT_ADI,
+           COUNT(DISTINCT T.HK_ID) AS CEMI_QEBUL, COUNT(*) AS XIDMET_SATIRI,
+           SUM({AMT}) AS SATIS, SUM({NAGD}) AS NAGD, SUM({SIG}) AS SIGORTA, SUM({ITS}) AS ITS,
+           SUM({KORP}) AS KORPORATIV
+    FROM fonethbys.V_IST_GENEL_HIZMET T
+    WHERE {PERIOD_T}
+      AND T.ISERVIS IN ({IN})
+      AND NVL(T.SR_ADI, '-') NOT IN ({IN})
+    GROUP BY T.ISERVIS, T.SR_ADI, T.ITU_ADI, T.IT_ADI
+    """
+
+    # --- E. Daxil olan yönləndirmələr: yalnız göndərəni QEYD OLUNMUŞ, kənar şöbələrdən ----------------
+    # (ISERVIS boş olan birbaşa müraciətlər əvvəl "yönləndirmə" kimi sayılırdı — indi çıxarılıb,
+    #  payı Məlumat Keyfiyyəti vərəqində göstərilir)
+    Q["gelen"] = f"""
+    SELECT T.ISERVIS AS GONDEREN_SOBE, T.SR_ADI AS QEBUL_EDEN_SOBE, MAX({G_T}) AS QRUP, T.ITU_ADI,
+           COUNT(DISTINCT T.HK_ID) AS CEMI_QEBUL, COUNT(*) AS XIDMET_SATIRI, SUM({AMT}) AS SATIS
+    FROM fonethbys.V_IST_GENEL_HIZMET T
+    WHERE {PERIOD_T}
+      AND T.SR_ADI IN ({IN})
+      AND T.ISERVIS IS NOT NULL
+      AND T.ISERVIS NOT IN ({IN})
+    GROUP BY T.ISERVIS, T.SR_ADI, T.ITU_ADI
+    """
+
+    # --- F. Məlumat keyfiyyəti — müstəqil yoxlama sorğusu --------------------------------------------
+    Q["dq"] = f"""
+    SELECT COUNT(*) AS SATIR, SUM({AMT}) AS SATIS,
+           SUM(CASE WHEN T.PERSKODU IS NULL THEN 1 ELSE 0 END)        AS HEKIMSIZ_SATIR,
+           SUM(CASE WHEN T.PERSKODU IS NULL THEN {AMT} ELSE 0 END)    AS HEKIMSIZ_SATIS,
+           SUM(CASE WHEN T.ISERVIS IS NULL THEN 1 ELSE 0 END)         AS ISERVIS_BOS,
+           SUM(CASE WHEN {AMT} < 0 THEN 1 ELSE 0 END)                 AS MENFI_SATIR,
+           SUM(CASE WHEN {AMT} < 0 THEN {AMT} ELSE 0 END)             AS MENFI_MEBLEG,
+           SUM(CASE WHEN {AMT} = 0 THEN 1 ELSE 0 END)                 AS SIFIR_SATIR,
+           MAX(T.HI_TARIH)                                            AS SON_TARIX
+    FROM fonethbys.V_IST_GENEL_HIZMET T
+    WHERE {PERIOD_T}
+      AND T.SR_ADI IN ({IN})
+    """
+
+    likes = " OR ".join(f"UPPER(T.SR_ADI) LIKE '%{p}%'" for p in MISSED_DEPT_PATTERNS)
+    nots = " ".join(f"AND UPPER(T.SR_ADI) NOT LIKE '%{p}%'" for p in MISSED_DEPT_EXCLUDE)
+    Q["missed"] = f"""
+    SELECT T.SR_ADI, COUNT(DISTINCT T.HK_ID) AS CEMI_QEBUL, SUM({AMT}) AS SATIS
+    FROM fonethbys.V_IST_GENEL_HIZMET T
+    WHERE {PERIOD_T}
+      AND T.SR_ADI NOT IN ({IN})
+      AND ({likes})
+      {nots}
+    GROUP BY T.SR_ADI
+    """
+    # --- G. Dərman və material çıxışları (aqreqat, dərman adı səviyyəsində) ---------------------------
+    # Növ 1-2: pasiyentə (istəyən şöbəyə yazılır) · 3: şöbə deposundan digər çıxış · 4-5: şöbəyə təchizat
+    # Pasiyentin adı (növ 1-2 üçün çıxış yeri) heç vaxt çəkilmir.
+    INX = sql_list(drug_names(cfg))
+    # Ödəniş növü: 'Ücretli' -> nağd; 'Sigortalı' -> pasiyentin sinfi (xidmət statistikasından) və ya təşkilat adı
+    PAYD = (f"CASE WHEN T.FORMTYPE NOT IN (1, 2) THEN NULL "
+            f"WHEN UPPER(NVL(T.ODEMETURU, '-')) LIKE '%CRET%' THEN 'NAGD' "
+            f"ELSE {pay_case('S.HSINIFADI', 'T.ILACGRUPADI')} END")
+    Q["drug"] = f"""
+    WITH S AS (
+        SELECT H.HK_ID, MAX(H.HSINIFADI) AS HSINIFADI
+        FROM fonethbys.V_IST_GENEL_HIZMET H
+        WHERE H.HI_TARIH >= :start_dt AND H.HI_TARIH < :end_dt
+        GROUP BY H.HK_ID
+    ),
+    D AS (
+        SELECT T.FORMTYPE, T.HSERVISADI, T.DEPOADI,
+               CASE WHEN T.FORMTYPE IN (1, 2) THEN NULL ELSE T.CIKISBIRIMADI END AS CIKIS_YERI,
+               T.PAKET_DURUMU, T.SNLMALZEMEADI AS DERMAN_AD, T.SNLBIRIMADI AS BIRIM,
+               {PAYD} AS PAY,
+               CASE WHEN T.FORMTYPE IN (1, 2) AND UPPER(NVL(T.ODEMETURU, '-')) NOT LIKE '%CRET%'
+                    THEN NVL(T.ILACGRUPADI, '—') END AS KURUM,
+               T.MIKTAR, T.SNLTUTAR, T.SNLALISTUTAR
+        FROM fonethbys.v_stok_list_cikisfisdetay T
+        LEFT JOIN S ON S.HK_ID = T.HASTA_HKID
+        WHERE T.TARIH >= :start_dt AND T.TARIH < :end_dt
+          AND T.FORMTYPE IN (1, 2, 3, 4, 5)
+          AND (T.HSERVISADI IN ({INX}) OR T.DEPOADI IN ({INX})
+               OR (T.FORMTYPE NOT IN (1, 2) AND T.CIKISBIRIMADI IN ({INX})))
+    )
+    SELECT FORMTYPE, HSERVISADI, DEPOADI, CIKIS_YERI, PAKET_DURUMU, DERMAN_AD, BIRIM, PAY, KURUM,
+           COUNT(*) AS SATIR, SUM(NVL(MIKTAR, 0)) AS MIQDAR,
+           SUM(NVL(SNLTUTAR, 0)) AS SATIS, SUM(NVL(SNLALISTUTAR, 0)) AS MAYA
+    FROM D
+    GROUP BY FORMTYPE, HSERVISADI, DEPOADI, CIKIS_YERI, PAKET_DURUMU, DERMAN_AD, BIRIM, PAY, KURUM
+    """
+
+    # --- K. Həkim qazancı (hakediş): 1 = icra edən, 2 = göndərən; şöbə = icra edilən xidmətin şöbəsi -----
+    if hak:
+        HSUM = ("SUM(CASE WHEN TO_CHAR(T.HAKEDISTURU) = '1' THEN NVL(T.HAKTUTAR, 0) ELSE 0 END) AS HK_YAPAN, "
+                "SUM(CASE WHEN TO_CHAR(T.HAKEDISTURU) = '2' THEN NVL(T.HAKTUTAR, 0) ELSE 0 END) AS HK_GONDEREN")
+        HW = f"T.HI_TARIH >= :start_dt AND T.HI_TARIH < :end_dt AND T.SR_ADI IN ({IN})"
+        Q["hak"] = f"SELECT T.SR_ADI, {HSUM} FROM fonethbys.V_HAKEDIS_RAPOR T WHERE {HW} GROUP BY T.SR_ADI"
+        dc, dn = hak.get("code"), hak.get("name")
+        if dc:
+            nm = f"MAX(T.{dn})" if dn else "CAST(NULL AS VARCHAR2(200))"
+            Q["hak_hekim"] = (f"SELECT T.SR_ADI, TO_CHAR(T.{dc}) AS PERSKODU, {nm} AS HDOKTORADI, {HSUM} "
+                              f"FROM fonethbys.V_HAKEDIS_RAPOR T WHERE {HW} GROUP BY T.SR_ADI, TO_CHAR(T.{dc})")
+        elif dn:
+            Q["hak_hekim"] = (f"SELECT T.SR_ADI, CAST(NULL AS VARCHAR2(50)) AS PERSKODU, T.{dn} AS HDOKTORADI, {HSUM} "
+                              f"FROM fonethbys.V_HAKEDIS_RAPOR T WHERE {HW} GROUP BY T.SR_ADI, T.{dn}")
+
+    # --- J. Dövrdə xidməti olan bütün şöbələr (dərman ötürməsinin hədəfini avtomatik tanımaq üçün) -----
+    Q["klinik"] = f"""
+    SELECT DISTINCT T.SR_ADI FROM fonethbys.V_IST_GENEL_HIZMET T WHERE {PERIOD_T}
+    """
+
+    # --- I. Təşkilatlar üzrə xidmət satışı (qurum payı olan bütün təşkilatlar) ----------------------
+    KCOL = "T.HKURUMADI" if use_kurum else "T.HSINIFADI"
+    Q["org_xidmet"] = f"""
+    SELECT PAY, KURUM, COUNT(DISTINCT HK_ID) AS CEMI_QEBUL, COUNT(DISTINCT HK_KAYITKODU) AS UNIKAL_PASIYENT,
+           SUM(K) AS TESKILAT_XIDMET, SUM(H) AS PASIYENT_XIDMET
+    FROM (
+        SELECT {PAYX} AS PAY, NVL({KCOL}, '—') AS KURUM, T.HK_ID, T.HK_KAYITKODU,
+               NVL(T.HI_KTUTAR, 0) AS K, NVL(T.HI_HTUTAR, 0) AS H
+        FROM fonethbys.V_IST_GENEL_HIZMET T
+        WHERE {PERIOD_T}
+          AND T.SR_ADI IN ({IN})
+          AND NVL(T.HI_KTUTAR, 0) <> 0
+    )
+    GROUP BY PAY, KURUM
+    """
+
+    # --- H. Həkim üzrə təyin olunan dərman (həkim kodu xidmət statistikasındakı kodla eynidir) -------
+    Q["drug_hekim"] = f"""
+    SELECT T.HSERVISADI AS SR_ADI, T.OZELKOD5 AS PERSKODU, MAX(T.HDOKTORADI) AS HDOKTORADI, T.PAKET_DURUMU,
+           SUM(NVL(T.SNLTUTAR, 0)) AS SATIS, SUM(NVL(T.SNLALISTUTAR, 0)) AS MAYA
+    FROM fonethbys.v_stok_list_cikisfisdetay T
+    WHERE T.TARIH >= :start_dt AND T.TARIH < :end_dt
+      AND T.FORMTYPE IN (1, 2)
+      AND T.HSERVISADI IN ({IN})
+    GROUP BY T.HSERVISADI, T.OZELKOD5, T.PAKET_DURUMU
+    """
+    # Ehtiyat variant: view-da həkim kodu (OZELKOD5) yoxdursa — həkim adı ilə, Python-da xidmət həkiminə bağlanır
+    Q["drug_hekim_alt"] = f"""
+    SELECT T.HSERVISADI AS SR_ADI, CAST(NULL AS VARCHAR2(50)) AS PERSKODU, T.HDOKTORADI, T.PAKET_DURUMU,
+           SUM(NVL(T.SNLTUTAR, 0)) AS SATIS, SUM(NVL(T.SNLALISTUTAR, 0)) AS MAYA
+    FROM fonethbys.v_stok_list_cikisfisdetay T
+    WHERE T.TARIH >= :start_dt AND T.TARIH < :end_dt
+      AND T.FORMTYPE IN (1, 2)
+      AND T.HSERVISADI IN ({IN})
+    GROUP BY T.HSERVISADI, T.HDOKTORADI, T.PAKET_DURUMU
+    """
+    return Q
+
+
+# =====================================================================================
+# 3. MƏLUMATIN ÇƏKİLMƏSİ
+# =====================================================================================
+def run_query(conn, sql, params):
+    binds = {k: v for k, v in params.items() if re.search(r":" + k + r"\b", sql)}
+    with conn.cursor() as cur:
+        cur.arraysize = 5000
+        cur.execute(sql, binds)
+        cols = [c[0].upper() for c in cur.description]
+        rows = cur.fetchall()
+    return pd.DataFrame(rows, columns=cols)
+
+
+# Əlavə sorğular: xəta versə filial hesabatdan çıxmır (dəyər — ehtiyat sorğunun adı və ya None)
+OPTIONAL_QUERIES = {"drug": None, "drug_hekim": "drug_hekim_alt", "missed": None, "org_xidmet": None, "klinik": None,
+                    "hak": None, "hak_hekim": None}
+FALLBACK_ONLY = {"drug_hekim_alt"}
+
+
+def fetch_live(start, end_excl):
+    import oracledb
+    oracledb.init_oracle_client(lib_dir=ORACLE_CLIENT_DIR)
+    password = os.environ.get("FONET_DB_PASS") or getpass.getpass(f"{DB_USER} üçün FONET parolu: ")
+    params = {"start_dt": start, "end_dt": end_excl}
+
+    data, status = {}, []
+    for branch, cfg in BRANCHES.items():
+        t0 = time.time()
+        print(f"[{branch}] {cfg['dsn']} bazasına qoşulur...")
+        notes = []
+        try:
+            out = {}
+            use_kurum, hak = True, None
+            with oracledb.connect(user=DB_USER, password=password, dsn=cfg["dsn"]) as conn:
+                try:  # təşkilat adı sütunu bu filialın bazasında varmı?
+                    run_query(conn, "SELECT T.HKURUMADI FROM fonethbys.V_IST_GENEL_HIZMET T WHERE ROWNUM = 1", {})
+                except Exception:
+                    use_kurum = False
+                    notes.append(("kurum", "alt"))
+                    print("    təşkilat adı sütunu yoxdur — ödəniş növü yalnız pasiyent sinfi üzrə təyin olunur")
+                try:  # həkim qazancı view-u və onun həkim sütunu
+                    cols = set(run_query(conn, "SELECT * FROM fonethbys.V_HAKEDIS_RAPOR WHERE ROWNUM = 1", {}).columns)
+                    hak = {"code": next((c for c in HAK_CODE_CANDIDATES if c in cols), None),
+                           "name": next((c for c in HAK_NAME_CANDIDATES if c in cols), None)}
+                    if not hak["code"]:
+                        notes.append(("hak_kod", "alt" if hak["name"] else "yox"))
+                    print(f"    həkim qazancı: həkim sütunu = {hak['code'] or hak['name'] or 'tapılmadı'}")
+                except Exception as he:
+                    notes.append(("hak", "yox"))
+                    print(f"    həkim qazancı view-u əlçatan deyil: {str(he).splitlines()[0]}")
+            Q = build_queries(cfg, use_kurum=use_kurum, hak=hak)
+            with oracledb.connect(user=DB_USER, password=password, dsn=cfg["dsn"]) as conn:
+                for name, sql in Q.items():
+                    if name in FALLBACK_ONLY:
+                        continue
+                    try:
+                        out[name] = run_query(conn, sql, params)
+                    except Exception as qe:
+                        if name not in OPTIONAL_QUERIES:
+                            raise
+                        alt = OPTIONAL_QUERIES[name]
+                        print(f"    {name:<10} XƏTA: {str(qe).splitlines()[0]}")
+                        if alt:
+                            try:
+                                out[name] = run_query(conn, Q[alt], params)
+                                notes.append((name, "alt"))
+                                print(f"    {name:<10} ehtiyat üsulla alındı")
+                                continue
+                            except Exception as qe2:
+                                print(f"    {name:<10} ehtiyat üsul da alınmadı: {str(qe2).splitlines()[0]}")
+                        notes.append((name, "yox"))
+                        continue
+                    print(f"    {name:<10} {len(out[name]):>6} sətir")
+            data[branch] = out
+            status.append({"FILIAL": branch, "OK": True, "SANIYE": round(time.time() - t0, 1), "XETA": "",
+                           "NOTES": notes})
+            print(f"[{branch}] hazırdır ({time.time() - t0:.1f} san).")
+        except Exception as e:  # əsas sorğu xətası — filial hesabata düşmür, nəzarət faylında ✖
+            status.append({"FILIAL": branch, "OK": False, "SANIYE": round(time.time() - t0, 1), "XETA": str(e)[:300],
+                           "NOTES": notes})
+            print(f"[{branch}] XƏTA: {e}")
+    return data, status
+
+
+# =====================================================================================
+# 4. DEMO MƏLUMAT (bazasız dizayn yoxlaması; SQL məntiqini pandas-da təkrarlayır)
+# =====================================================================================
+DEMO_SIG_CLASS = {"Babək": "Sigorta Xəstələri", "Mərkəz": "Sığortalı pasientlər", "Medilux": "Sigorta Hastalari"}
+DEMO_ITS_CLASS = {"Babək": "Sigorta Xəstələri", "Mərkəz": "İcabri tibbi sığorta", "Medilux": "Sigorta Hastalari"}
+DEMO_INSURERS = ["Paşa Sığorta", "Premium Assistance MMC", "A-GROUP", "Atəşgah sığorta", "Qala Sığorta", "Xalq Sığorta"]
+DEMO_CORPS = ["DKT İnşaat", "Bravo", "AZTEM", "Rahat Market", "Sənaye Təbabəti"]
+
+
+def demo_fetch(start, end_excl):
+    data, status = {}, []
+    days = (end_excl - start).days
+    ext_out = [("Laboratoriya", "Laboratoriya", "Ümumi qan analizi"), ("Laboratoriya", "Laboratoriya", "Biokimya"),
+               ("Radiologiya", "Radiologiya", "USM"), ("Radiologiya", "Radiologiya", "Rentgen"),
+               ("Kardiologiya", "Konsultasiya", "EXO-KQ"), ("Nevrologiya", "Konsultasiya", "Nevroloq müayinəsi")]
+    ext_in = ["Doğum şöbəsi", "Ginekologiya", "Terapiya", "Cərrahiyyə", "LOR"]
+    first = ["Aysel", "Rəşad", "Günel", "Elvin", "Nigar", "Tural", "Ləman", "Orxan", "Səbinə", "Fərid",
+             "Kamran", "Aytən", "Vüsal", "Lalə", "Murad", "Nərmin", "Samir", "Zəhra"]
+    last = ["Məmmədova", "Əliyev", "Həsənova", "Quliyev", "İsmayılova", "Hüseynov", "Abbasova", "Kərimov"]
+    gp = {"PED": (3600, 0.06, 45, 2.2), "NEO": (500, 0.55, 160, 3.0), "TTY": (1200, 0.10, 60, 1.6), "FIZ": (350, 0.0, 35, 3.5)}
+    scale = {"Babək": 1.0, "Mərkəz": 0.72, "Medilux": 0.55}
+
+    for bi, (branch, cfg) in enumerate(BRANCHES.items()):
+        rng = np.random.default_rng(42 + bi)
+        recs, yat, hk = [], [], 1000
+        docs = {}
+        for g, ds in cfg["groups"].items():
+            if not ds:
+                continue
+            n_adm, p_stas, avg_amt, n_serv = gp.get(g, (900, 0.2, 80, 2.0))
+            n_adm = int(n_adm * scale[branch] * rng.uniform(0.85, 1.15))
+            pool = max(int(n_adm * 0.6), 10)
+            pid = rng.integers(0, pool, n_adm) + bi * 100000 + GROUP_ORDER.index(g) * 10000
+            for d in ds:
+                docs[d] = [(f"{bi}{GROUP_ORDER.index(g)}{k:02d}", f"{rng.choice(first)} {rng.choice(last)}")
+                           for k in range(int(rng.integers(2, 7)))]
+            w = np.array([3.0] + [1.0] * (len(ds) - 1)); w /= w.sum()
+            for i in range(n_adm):
+                hk += 1
+                dt = start + timedelta(days=int(rng.integers(0, days)), hours=int(rng.integers(8, 20)))
+                tur = "Y" if rng.random() < p_stas else "A"
+                main = ds[rng.choice(len(ds), p=w)]
+                kind = rng.choice(["N", "S", "I", "K"], p=[0.55, 0.28, 0.07, 0.10])
+                cls, kur = {"N": ("Ödənişli Xəstələr", "Ödənişli Xəstələr"),
+                            "S": (DEMO_SIG_CLASS[branch], rng.choice(DEMO_INSURERS)),
+                            "I": (DEMO_ITS_CLASS[branch], "İcbari tibbi sığorta"),
+                            "K": ("Korparativ", rng.choice(DEMO_CORPS))}[kind]
+                iserv = None if rng.random() < 0.7 else main
+                for s in range(1 + rng.poisson(n_serv)):
+                    d = main if rng.random() < 0.88 else ds[rng.integers(0, len(ds))]
+                    doc = docs[d][rng.integers(0, len(docs[d]))] if rng.random() > 0.03 else (None, None)
+                    amt = round(float(rng.lognormal(np.log(avg_amt), 0.6)) * (1.15 if branch == "Mərkəz" else 1), 2)
+                    if rng.random() < 0.003:
+                        amt = -amt
+                    h, k = (amt, 0.0) if kind == "N" else ((round(amt * 0.1, 2), round(amt * 0.9, 2))
+                                                             if kind == "S" else (0.0, amt))
+                    isv = rng.choice(ext_in) if rng.random() < 0.06 else iserv
+                    recs.append((d, g, hk, int(pid[i]), tur, doc[0], doc[1], cls, h, k, dt, isv, "Xidmət", "Müayinə", kur))
+                for _ in range(rng.poisson(0.9)):
+                    e = ext_out[rng.integers(0, len(ext_out))]
+                    amt = round(float(rng.lognormal(np.log(25), 0.5)), 2)
+                    h, k = (amt, 0.0) if kind == "N" else (round(amt * .1, 2), round(amt * .9, 2))
+                    recs.append((e[0], None, hk, int(pid[i]), tur, "L01", "Lab", cls, h, k, dt, main, e[1], e[2], kur))
+                if tur == "Y":
+                    los = int(rng.geometric(0.25))
+                    out = dt + timedelta(days=los)
+                    yat.append((main, g, hk, dt, out if out < end_excl and rng.random() > 0.05 else None))
+
+        rows = pd.DataFrame(recs, columns=["SR_ADI", "QRUP", "HK_ID", "HK_KAYITKODU", "HK_HASTATURU", "PERSKODU",
+                                           "PERSADI", "HSINIFADI", "H", "K", "HI_TARIH", "ISERVIS", "ITU_ADI", "IT_ADI",
+                                           "HKURUMADI"])
+        yrows = pd.DataFrame(yat, columns=["SR_ADI", "QRUP", "HK_ID", "GIRIS", "CIKIS"])
+        data[branch] = _demo_aggregate(rows, yrows, cfg, rng)
+        status.append({"FILIAL": branch, "OK": True, "SANIYE": 0.0, "XETA": ""})
+    return data, status
+
+
+def _demo_aggregate(rows, yrows, cfg, rng):
+    IN = set(all_depts(cfg))
+    rows["AMT"] = rows["H"] + rows["K"]
+    rows["PAY"] = [pay_class(a, b) for a, b in zip(rows["HSINIFADI"], rows["HKURUMADI"])]
+    rows["SIG"] = np.where(rows["PAY"] == "SIG", rows["K"], 0.0)
+    rows["ITS"] = np.where(rows["PAY"] == "ITS", rows["K"], 0.0)
+    rows["KORP"] = np.where(rows["PAY"] == "KORP", rows["K"], 0.0)
+    x = rows[rows["SR_ADI"].isin(IN)].copy()
+    # yeni = pasiyentin ilk müraciəti (dövrdən əvvəl tarixçəsi olanların ~45%-i)
+    adm = x.groupby("HK_ID").agg(KAY=("HK_KAYITKODU", "first"), DT=("HI_TARIH", "min")).reset_index()
+    adm = adm.sort_values(["DT", "HK_ID"])
+    prior = set(pd.Series(adm["KAY"].unique()).sample(frac=0.45, random_state=1))
+    adm["YENI"] = (~adm["KAY"].duplicated() & ~adm["KAY"].isin(prior)).astype(int)
+    x = x.merge(adm[["HK_ID", "YENI"]], on="HK_ID")
+
+    def levels(df, col):
+        return pd.concat([df.assign(SEVIYYE="S", OBYEKT=df[col]),
+                          df.assign(SEVIYYE="Q", OBYEKT=df["QRUP"]),
+                          df.assign(SEVIYYE="F", OBYEKT="ALL", QRUP="ALL")])
+
+    L = levels(x, "SR_ADI")
+    L["AMB"] = L["HK_ID"].where(L["HK_HASTATURU"].str.startswith("A"))
+    L["STAS"] = L["HK_ID"].where(L["HK_HASTATURU"].str.startswith("Y"))
+    L["YID"] = L["HK_ID"].where(L["YENI"] == 1)
+    L["TID"] = L["HK_ID"].where(L["YENI"] == 0)
+    met = L.groupby(["SEVIYYE", "OBYEKT"]).agg(
+        QRUP=("QRUP", "max"), AMB_QEBUL=("AMB", "nunique"), STAS_QEBUL=("STAS", "nunique"),
+        CEMI_QEBUL=("HK_ID", "nunique"), YENI_QEBUL=("YID", "nunique"), TEKRAR_QEBUL=("TID", "nunique"),
+        UNIKAL_PASIYENT=("HK_KAYITKODU", "nunique"), HEKIM_SAYI=("PERSKODU", "nunique"),
+        XIDMET_SATIRI=("HK_ID", "size"), SATIS=("AMT", "sum"), NAGD=("H", "sum"),
+        SIGORTA=("SIG", "sum"), ITS=("ITS", "sum"), KORPORATIV=("KORP", "sum")).reset_index()
+    Y = levels(yrows, "SR_ADI")
+    yk = Y.groupby(["SEVIYYE", "OBYEKT", "HK_ID"]).agg(GIRIS=("GIRIS", "min"), CIKIS=("CIKIS", "max"),
+                                                       ACIQ=("CIKIS", lambda s: int(s.isna().any()))).reset_index()
+    yk["LOS"] = np.where(yk["ACIQ"] == 0, ((pd.to_datetime(yk["CIKIS"]).dt.normalize()
+                                            - pd.to_datetime(yk["GIRIS"]).dt.normalize()).dt.days).clip(lower=1), np.nan)
+    ya = yk.groupby(["SEVIYYE", "OBYEKT"]).agg(HOSP_SAYI=("HK_ID", "size"), HELE_YATAN=("ACIQ", "sum"),
+                                                ORTA_YATIS=("LOS", "mean")).reset_index()
+    ya["TAXIS_SAYI"] = ya["HOSP_SAYI"] - ya["HELE_YATAN"]
+    met = met.merge(ya, on=["SEVIYYE", "OBYEKT"], how="left")
+
+    hek = x.groupby(["SR_ADI", "PERSKODU"], dropna=False).agg(
+        QRUP=("QRUP", "max"), PERSADI=("PERSADI", "max"), CEMI_QEBUL=("HK_ID", "nunique"),
+        UNIKAL_PASIYENT=("HK_KAYITKODU", "nunique"), XIDMET_SATIRI=("HK_ID", "size"), SATIS=("AMT", "sum"),
+        NAGD=("H", "sum"), SIGORTA=("SIG", "sum"), ITS=("ITS", "sum"), KORPORATIV=("KORP", "sum")).reset_index()
+
+    x["AY"] = pd.to_datetime(x["HI_TARIH"]).dt.to_period("M").dt.to_timestamp()
+    ay = pd.concat([x.groupby(["QRUP", "AY"]).agg(CEMI_QEBUL=("HK_ID", "nunique"), SATIS=("AMT", "sum")).reset_index(),
+                    x.groupby("AY").agg(CEMI_QEBUL=("HK_ID", "nunique"), SATIS=("AMT", "sum")).reset_index().assign(QRUP="ALL")])
+
+    o = rows[rows["ISERVIS"].isin(IN) & ~rows["SR_ADI"].isin(IN)].copy()
+    o["QRUP"] = o["ISERVIS"].map({d: g for g, ds in cfg["groups"].items() for d in ds})
+    geden = o.groupby(["ISERVIS", "SR_ADI", "ITU_ADI", "IT_ADI"]).agg(
+        QRUP=("QRUP", "max"), CEMI_QEBUL=("HK_ID", "nunique"), XIDMET_SATIRI=("HK_ID", "size"), SATIS=("AMT", "sum"),
+        NAGD=("H", "sum"), SIGORTA=("SIG", "sum"), ITS=("ITS", "sum"), KORPORATIV=("KORP", "sum")).reset_index().rename(
+        columns={"ISERVIS": "GONDEREN_SOBE", "SR_ADI": "ICRACI_SOBE"})
+    i = x[x["ISERVIS"].notna() & ~x["ISERVIS"].isin(IN)]
+    gelen = i.groupby(["ISERVIS", "SR_ADI", "ITU_ADI"]).agg(
+        QRUP=("QRUP", "max"), CEMI_QEBUL=("HK_ID", "nunique"), XIDMET_SATIRI=("HK_ID", "size"),
+        SATIS=("AMT", "sum")).reset_index().rename(columns={"ISERVIS": "GONDEREN_SOBE", "SR_ADI": "QEBUL_EDEN_SOBE"})
+    dq = pd.DataFrame([{
+        "SATIR": len(x), "SATIS": x["AMT"].sum(),
+        "HEKIMSIZ_SATIR": int(x["PERSKODU"].isna().sum()), "HEKIMSIZ_SATIS": x.loc[x["PERSKODU"].isna(), "AMT"].sum(),
+        "ISERVIS_BOS": int(x["ISERVIS"].isna().sum()), "MENFI_SATIR": int((x["AMT"] < 0).sum()),
+        "MENFI_MEBLEG": x.loc[x["AMT"] < 0, "AMT"].sum(), "SIFIR_SATIR": int((x["AMT"] == 0).sum()),
+        "SON_TARIX": x["HI_TARIH"].max()}])
+    missed = pd.DataFrame([{"SR_ADI": "Pediatriya (köhnə)", "CEMI_QEBUL": 14, "SATIS": 612.4}]) \
+        if rng.random() < 0.5 else pd.DataFrame(columns=["SR_ADI", "CEMI_QEBUL", "SATIS"])
+    drug, drug_hek = _demo_drug(cfg, x, rng)
+    ox = x[x["K"] != 0].groupby(["PAY", "HKURUMADI"]).agg(
+        CEMI_QEBUL=("HK_ID", "nunique"), UNIKAL_PASIYENT=("HK_KAYITKODU", "nunique"),
+        TESKILAT_XIDMET=("K", "sum"), PASIYENT_XIDMET=("H", "sum")).reset_index().rename(columns={"HKURUMADI": "KURUM"})
+    klinik = pd.DataFrame({"SR_ADI": sorted(set(rows["SR_ADI"].dropna()) | {"Reanimasiya Şöbəsi"})})
+    x["HY"] = x["AMT"] * 0.22
+    x["HG"] = np.where(x["ISERVIS"].notna(), x["AMT"] * 0.05, 0.0)
+    hak = x.groupby("SR_ADI").agg(HK_YAPAN=("HY", "sum"), HK_GONDEREN=("HG", "sum")).reset_index()
+    hak_hek = x[x["PERSKODU"].notna()].groupby(["SR_ADI", "PERSKODU"]).agg(
+        HDOKTORADI=("PERSADI", "max"), HK_YAPAN=("HY", "sum"), HK_GONDEREN=("HG", "sum")).reset_index()
+    return {"hak": hak, "hak_hekim": hak_hek, "klinik": klinik, "org_xidmet": ox, "met": met, "hekim": hek, "ay": ay, "geden": geden, "gelen": gelen, "dq": dq, "missed": missed,
+            "drug": drug, "drug_hekim": drug_hek}
+
+
+def _demo_drug(cfg, x, rng):
+    """Dərman sorğusunun nəticəsini təqlid edir (yalnız --demo)."""
+    meds = [("Seftriakson 1q flakon", "flakon", 4.2), ("Natrium xlorid 0.9% 100ml", "şüşə", 1.1),
+            ("Parasetamol 120mg/5ml şərbət", "şüşə", 3.5), ("Ampisillin 500mg", "flakon", 2.8),
+            ("Kateter periferik 24G", "ədəd", 1.9), ("Surfaktant (Kurosurf) 120mg", "flakon", 410.0),
+            ("Kofein sitrat 20mg/ml", "ampul", 9.5), ("Deksametazon 4mg", "ampul", 0.9),
+            ("Salbutamol nebula 2.5mg", "ampul", 0.7), ("İnfuziya sistemi", "ədəd", 0.8),
+            ("Şpris 5ml", "ədəd", 0.12), ("Əlcək steril", "cüt", 0.35), ("Vankomisin 500mg", "flakon", 14.0),
+            ("Meropenem 1q", "flakon", 18.5), ("Qlükoza 10% 250ml", "şüşə", 1.6)]
+    vol = defaultdict(lambda: 1.0, {"PED": 1.0, "NEO": 1.6, "TTY": 0.9, "FIZ": 0.05})
+    dests = [("Teserrufat Tullanti Anbar", 0.35), ("Derman Tullantı Anbarı", 0.1), ("Xüsusi Layihə X", 0.03),
+             ("Müvəqqəti inventar saxlama deposu", 0.25), ("Reanimasiya Şöbəsi", 0.1),
+             ("OFİS LƏVAZİMATLARI TULLANTI ANBARI", 0.1), ("Salyan Məntəqə deposu", 0.1)]
+    rows = []
+    for g, ds in cfg["groups"].items():
+        for d in ds:
+            for name, unit, price in meds:
+                k = vol[g] * rng.uniform(0.3, 1.7)
+                q = max(int(rng.poisson(120 * k / max(price, 1) ** 0.5)), 0)
+                if q == 0:
+                    continue
+                maya = round(q * price, 2)
+                dep = d if rng.random() > 0.2 else "Poliklinika"          # bəzən ümumi depodan verilir
+                rows.append((2, d, dep, None, "Paket Hariç", name, unit, q, q, round(maya * rng.uniform(1.4, 1.8), 2), maya))
+                if rng.random() < 0.1:                                      # şöbənin deposu başqa şöbənin pasiyentinə
+                    rows.append((2, "Ortopediya və Travmatologiya", d, None, "Paket Hariç", name, unit, q // 2, q // 2,
+                                 round(maya * 0.8, 2), round(maya / 2, 2)))
+                if rng.random() < 0.5:
+                    rows.append((2, d, d, None, "Paket Dahil", name, unit, q // 3, q // 3, 0.0, round(maya / 3, 2)))
+            if g in ("PED", "NEO", "TTY") and rng.random() < 0.6:
+                for dn, w in dests:
+                    if g != "TTY" and "Məntəqə" in dn:
+                        continue
+                    amt = round(rng.uniform(300, 4000) * w * vol[g], 2)
+                    rows.append((3, None, d, dn, "Paket Hariç", "Müxtəlif sərf materialı", "ədəd", 10, 10, amt, amt))
+                tot = sum(r[10] for r in rows if r[2] == d)
+                rows.append((4, None, "Eczane Anbarı", d, "Paket Hariç", "Dərman təchizatı", "ədəd", 50, 50,
+                             round(tot * 0.8, 2), round(tot * 0.8, 2)))
+                rows.append((5, None, "Təsərruffat Anbarı", d, "Paket Hariç", "Təsərrüfat təchizatı", "ədəd", 30, 30,
+                             round(tot * 0.15, 2), round(tot * 0.15, 2)))
+    drug = pd.DataFrame(rows, columns=["FORMTYPE", "HSERVISADI", "DEPOADI", "CIKIS_YERI", "PAKET_DURUMU", "DERMAN_AD",
+                                       "BIRIM", "SATIR", "MIQDAR", "SATIS", "MAYA"])
+    p2 = drug["FORMTYPE"] == 2
+    kind = rng.choice(["NAGD", "SIG", "ITS", "KORP"], p=[0.72, 0.2, 0.04, 0.04], size=len(drug))
+    drug["PAY"] = np.where(p2, kind, None)
+    drug["KURUM"] = [None if (not f or k == "NAGD") else (rng.choice(DEMO_INSURERS) if k == "SIG" else
+                     ("İcbari tibbi sığorta" if k == "ITS" else rng.choice(DEMO_CORPS)))
+                     for f, k in zip(p2, kind)]
+    # həkim üzrə: dərman gəlirini həkimin xidmət payına görə bölürük
+    p2 = drug[drug["FORMTYPE"] == 2].groupby(["HSERVISADI", "PAKET_DURUMU"])[["SATIS", "MAYA"]].sum().reset_index()
+    w = x[x["PERSKODU"].notna()].groupby(["SR_ADI", "PERSKODU"]).agg(N=("HK_ID", "size"), AD=("PERSADI", "max")).reset_index()
+    w["W"] = w["N"] / w.groupby("SR_ADI")["N"].transform("sum")
+    dh = p2.merge(w, left_on="HSERVISADI", right_on="SR_ADI")
+    dh["SATIS"] *= dh["W"]; dh["MAYA"] *= dh["W"]
+    dh = dh.rename(columns={"AD": "HDOKTORADI"})[["SR_ADI", "PERSKODU", "HDOKTORADI", "PAKET_DURUMU", "SATIS", "MAYA"]]
+    return drug, dh
+
+
+# =====================================================================================
+# 5. MODEL (pandas emalı)
+# =====================================================================================
+def _div(a, b):
+    a = pd.to_numeric(a, errors="coerce"); b = pd.to_numeric(b, errors="coerce")
+    return (a / b.replace(0, np.nan)).fillna(0.0)
+
+
+def _derive(df):
+    if df.empty:
+        return df
+    for c in ["SATIS", "NAGD", "SIGORTA", "ITS", "KORPORATIV"]:
+        if c in df:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0).round(2)
+    if "CEMI_QEBUL" in df and "SATIS" in df:
+        df["ORTA_CEK"] = _div(df["SATIS"], df["CEMI_QEBUL"])
+    if "NAGD" in df:
+        df["NAGD_PAY"] = _div(df["NAGD"], df["SATIS"])
+        df["SIG_PAY"] = _div(df["SIGORTA"], df["SATIS"])
+        if "ITS" in df:
+            df["ITS_PAY"] = _div(df["ITS"], df["SATIS"])
+        df["KORP_PAY"] = _div(df["KORPORATIV"], df["SATIS"])
+    if "YENI_QEBUL" in df:
+        df["YENI_PAY"] = _div(df["YENI_QEBUL"], df["CEMI_QEBUL"])
+    if "HEKIM_SAYI" in df:
+        df["HEKIM_BASI_QEBUL"] = _div(df["CEMI_QEBUL"], df["HEKIM_SAYI"])
+        df["HEKIM_BASI_SATIS"] = _div(df["SATIS"], df["HEKIM_SAYI"])
+    if "DERMAN_GELIR" in df:
+        for c in [x for x in DRUG_MEASURES if x in df]:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0).round(2)
+        df["DERMAN_MARJA"] = df["DERMAN_GELIR"] - df["DERMAN_MAYA"]
+        df["MARJA_PAY"] = _div(df["DERMAN_MARJA"], df["DERMAN_GELIR"])
+        for c in ["DERMAN_NAGD", "DERMAN_SIG", "DERMAN_ITS", "DERMAN_KORP"]:
+            if c in df:
+                df[c + "_PAY"] = _div(df[c], df["DERMAN_GELIR"])
+        if "PAKET_MAYA" in df:
+            df["DERMAN_XERC"] = df["DERMAN_MAYA"] + df["PAKET_MAYA"] + df.get("SERFIYYAT", 0)
+        if "SATIS" in df:
+            df["CEMI_GELIR"] = df["SATIS"] + df["DERMAN_GELIR"]
+            df["DERMAN_PAY"] = _div(df["DERMAN_GELIR"], df["CEMI_GELIR"])
+        if "CEMI_QEBUL" in df and "DERMAN_XERC" in df:
+            df["QEBUL_BASI_DERMAN"] = _div(df["DERMAN_XERC"], df["CEMI_QEBUL"])
+    if "HK_YAPAN" in df:
+        for c in ["HK_YAPAN", "HK_GONDEREN"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0).round(2)
+        df["HEKIM_QAZANC"] = df["HK_YAPAN"] + df["HK_GONDEREN"]
+        if "CEMI_GELIR" in df:
+            df["HEKIM_PAY"] = _div(df["HEKIM_QAZANC"], df["CEMI_GELIR"])
+        if "CEMI_GELIR" in df and "DERMAN_XERC" in df:
+            df["DOVRIYYE"] = df["CEMI_GELIR"] - df["DERMAN_XERC"] - df["HEKIM_QAZANC"]
+            df["DOVRIYYE_MARJA"] = _div(df["DOVRIYYE"], df["CEMI_GELIR"])
+            if "CEMI_QEBUL" in df:
+                df["DOVRIYYE_QEBUL"] = _div(df["DOVRIYYE"], df["CEMI_QEBUL"])
+    return df
+
+
+def _qlabel(code):
+    return TOTAL_LABEL if code == "ALL" else GROUP_LABEL.get(code, "Təsnifatsız")
+
+
+def _order(df, by_group_first=True):
+    df = df.copy()
+    df["_g"] = df["QRUP"].map(lambda c: GROUP_ORDER.index(c) if c in GROUP_ORDER else 99)
+    df["_b"] = df["FILIAL"].map(BRANCH_ORDER.index)
+    keys = ["_g", "_b"] if by_group_first else ["_b", "_g"]
+    return df.sort_values(keys + (["SATIS"] if "SATIS" in df else []),
+                          ascending=[True, True] + ([False] if "SATIS" in df else [])).drop(columns=["_g", "_b"])
+
+
+def month_days(ay, start, end_incl):
+    m0 = ay.date().replace(day=1)
+    m1 = (pd.Timestamp(m0) + pd.offsets.MonthEnd(0)).date()
+    lo, hi = max(m0, start.date()), min(m1, end_incl.date())
+    return max((hi - lo).days + 1, 0)
+
+
+DRUG_MEASURES = ["DERMAN_GELIR", "DERMAN_MAYA", "PAKET_MAYA", "SERFIYYAT", "KORP_MENTEQE", "TECHIZAT", "INV_CIXIS",
+                 "OTURME", "TESNIFSIZ", "DERMAN_NAGD", "DERMAN_SIG", "DERMAN_ITS", "DERMAN_KORP"]
+
+
+def _norm(x):
+    return str(x or "").upper().replace("İ", "I")
+
+
+def classify_dest(dest, clinical=None):
+    """Şöbə deposundan 'digər çıxış'ın (növ 3) istiqaməti — hədəf deponun adına və statusuna görə.
+    Qayda bütün filiallar üçün eynidir və hər dəfə avtomatik tətbiq olunur:
+      1) korporativ məntəqə  2) inventar  3) tullantı/imha -> şöbə sərfiyyatı
+      4) hədəf — dövrdə xidməti olan klinik şöbədir və ya depo/anbardır -> ötürmə (xərc deyil)
+      5) heç birinə uyğun deyil -> 'Təsnif olunmayıb' (xərcə daxil edilmir, nəzarət faylında ⚠)"""
+    u = _norm(dest)
+    if any(k in u for k in DRUG_CORP_KEYS):
+        return "Korporativ məntəqə"
+    if any(k in u for k in DRUG_INV_KEYS):
+        return "İnventar yerdəyişməsi"
+    if any(k in u for k in DRUG_WASTE_KEYS):
+        return "Şöbə sərfiyyatı"
+    if clinical is None or dest in clinical or any(k in u for k in DRUG_DEPOT_KEYS):
+        return "Şöbələrarası ötürmə"
+    return "Təsnif olunmayıb"
+
+
+def build_drug(data):
+    """Dərman çıxışlarını bölmə/şöbəyə bağlayır və göstəricilərə çevirir (bütün məbləğlər toplanandır)."""
+    lines, dests, bal, p12_all = [], [], [], []
+    for b, d in data.items():
+        df = d.get("drug")
+        if df is None or df.empty:
+            continue
+        cfg = BRANCHES[b]
+        n2g = name_to_group(cfg)
+        df = df.copy()
+        for c in ["SATIS", "MAYA", "MIQDAR", "SATIR"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+        df["FORMTYPE"] = pd.to_numeric(df["FORMTYPE"], errors="coerce").fillna(0).astype(int)
+        dahil = df["PAKET_DURUMU"].astype(str).str.upper().str.contains("DAH")
+        for c in DRUG_MEASURES:
+            df[c] = 0.0
+        df["OBYEKT"] = None
+        df["SINIF"] = None
+        # 1-2: pasiyentə — istəyən şöbəyə; istəyən boşdursa, verən depoya
+        p = df["FORMTYPE"].isin([1, 2])
+        own = df["HSERVISADI"].where(df["HSERVISADI"].isin(n2g.keys()))
+        own = own.fillna(df["DEPOADI"].where(df["HSERVISADI"].isna() & df["DEPOADI"].isin(n2g.keys())))
+        df.loc[p, "OBYEKT"] = own[p]
+        df.loc[p & ~dahil, "DERMAN_GELIR"] = df.loc[p & ~dahil, "SATIS"]
+        df.loc[p & ~dahil, "DERMAN_MAYA"] = df.loc[p & ~dahil, "MAYA"]
+        df.loc[p & dahil, "PAKET_MAYA"] = df.loc[p & dahil, "MAYA"]
+        if "PAY" not in df:
+            df["PAY"] = "NAGD"
+        if "KURUM" not in df:
+            df["KURUM"] = None
+        pay = df["PAY"].fillna("KORP")
+        for k in ["NAGD", "SIG", "ITS", "KORP"]:
+            mk = p & ~dahil & (pay == k)
+            df.loc[mk, "DERMAN_" + k] = df.loc[mk, "SATIS"]
+        # 3: şöbə deposundan digər çıxış — istiqamətə görə
+        t3 = (df["FORMTYPE"] == 3) & df["DEPOADI"].isin(n2g.keys())
+        df.loc[t3, "OBYEKT"] = df.loc[t3, "DEPOADI"]
+        kl = d.get("klinik")
+        clinical = set(kl["SR_ADI"].dropna()) if kl is not None and not kl.empty else None
+        df.loc[t3, "SINIF"] = df.loc[t3, "CIKIS_YERI"].map(lambda x: classify_dest(x, clinical))
+        col = {"Şöbə sərfiyyatı": "SERFIYYAT", "Korporativ məntəqə": "KORP_MENTEQE",
+               "İnventar yerdəyişməsi": "INV_CIXIS", "Şöbələrarası ötürmə": "OTURME", "Təsnif olunmayıb": "TESNIFSIZ"}
+        for k, c in col.items():
+            mk = t3 & (df["SINIF"] == k)
+            df.loc[mk, c] = df.loc[mk, "MAYA"]
+        # 4-5: şöbəyə təchizat (məlumat üçün)
+        t45 = df["FORMTYPE"].isin([4, 5]) & df["CIKIS_YERI"].isin(n2g.keys())
+        df.loc[t45, "OBYEKT"] = df.loc[t45, "CIKIS_YERI"]
+        df.loc[t45, "TECHIZAT"] = df.loc[t45, "MAYA"]
+        df["QRUP"] = df["OBYEKT"].map(n2g)
+        df["FILIAL"] = b
+        ours = df[df["OBYEKT"].notna()]
+        lines.append(ours)
+        # pasiyentə çıxışlar (növ 1-2) — həm istəyən şöbəyə, həm verən depoya görə aidiyyət üçün
+        p12 = df[p & (df["HSERVISADI"].isin(n2g.keys()) | df["DEPOADI"].isin(n2g.keys()))].copy()
+        if not p12.empty:
+            p12["ISTEYEN"] = p12["HSERVISADI"].fillna(p12["DEPOADI"])
+            p12["I_QRUP_AD"] = p12["ISTEYEN"].map(n2g).map(lambda c: GROUP_LABEL.get(c) if isinstance(c, str) else None)
+            p12["V_QRUP_AD"] = p12["DEPOADI"].map(n2g).map(lambda c: GROUP_LABEL.get(c) if isinstance(c, str) else None)
+            p12["PAKET"] = np.where(dahil[p12.index], "Paketə daxil", "Paketdən kənar")
+            p12["ODENIS_NOVU"] = np.where(dahil[p12.index], None, p12["PAY"].fillna("KORP").map(PAY_LABEL))
+            p12["FILIAL"] = b
+            p12_all.append(p12)
+        g3 = ours[ours["FORMTYPE"] == 3].groupby(["DEPOADI", "CIKIS_YERI", "SINIF"], dropna=False)["MAYA"].sum().reset_index()
+        dests.append(g3.assign(FILIAL=b))
+        # depo balansı bölmə üzrə: daxil olan təchizat vs öz depolarından çıxan (pasiyentə + digər çıxış)
+        dep_out = df[(df["FORMTYPE"].isin([1, 2, 3])) & df["DEPOADI"].isin(n2g.keys())].copy()
+        dep_out["G"] = dep_out["DEPOADI"].map(n2g)
+        cross = dep_out[dep_out["FORMTYPE"].isin([1, 2]) & ~dep_out["HSERVISADI"].isin(n2g.keys())
+                        & dep_out["HSERVISADI"].notna()]
+        sup = df[t45].assign(G=df.loc[t45, "CIKIS_YERI"].map(n2g))
+        for g in sorted(set(sup["G"]) | set(dep_out["G"])):
+            bal.append({"FILIAL": b, "QRUP": g,
+                        "TECHIZAT": float(sup.loc[sup["G"] == g, "MAYA"].sum()),
+                        "DEPO_CIXIS": float(dep_out.loc[dep_out["G"] == g, "MAYA"].sum()),
+                        "BASQA_SOBEYE": float(cross.loc[cross["DEPOADI"].map(n2g) == g, "MAYA"].sum())})
+
+    if not lines:
+        return {}
+    L = pd.concat(lines, ignore_index=True)
+    lv = pd.concat([L.assign(SEVIYYE="S"),
+                    L.assign(SEVIYYE="Q", OBYEKT=L["QRUP"]),
+                    L.assign(SEVIYYE="F", OBYEKT="ALL", QRUP="ALL")])
+    lvl = lv.groupby(["FILIAL", "SEVIYYE", "OBYEKT"]).agg(
+        QRUP_D=("QRUP", "max"), **{c: (c, "sum") for c in DRUG_MEASURES}).reset_index()
+    cons = L[L["FORMTYPE"].isin([1, 2, 3])].copy()
+    cons["XERC"] = cons["DERMAN_MAYA"] + cons["PAKET_MAYA"] + cons["SERFIYYAT"]
+    top = cons.groupby(["FILIAL", "QRUP", "DERMAN_AD", "BIRIM"], dropna=False).agg(
+        MIQDAR=("MIQDAR", "sum"), DERMAN_GELIR=("DERMAN_GELIR", "sum"), DERMAN_XERC=("XERC", "sum")).reset_index()
+    top = top[top["DERMAN_XERC"] > 0]
+    top["QRUP_PAY"] = _div(top["DERMAN_XERC"], top.groupby(["FILIAL", "QRUP"])["DERMAN_XERC"].transform("sum"))
+    top["DERMAN_RANK"] = top.groupby(["FILIAL", "QRUP"])["DERMAN_XERC"].rank(ascending=False, method="first").astype(int)
+    top = top[top["DERMAN_RANK"] <= 15]
+    top["QRUP_AD"] = top["QRUP"].map(_qlabel)
+    top["_b"] = top["FILIAL"].map(BRANCH_ORDER.index)
+    top["_g"] = top["QRUP"].map(lambda c: GROUP_ORDER.index(c) if c in GROUP_ORDER else 99)
+    top = top.sort_values(["_b", "_g", "DERMAN_RANK"]).drop(columns=["_b", "_g"])
+    top["DERMAN_AD"] = top["DERMAN_AD"].fillna("—")
+    top["BIRIM"] = top["BIRIM"].fillna("—")
+    # Mənbə detalları: hər məbləğin hansı şöbə/depodan, hansı çıxış növü ilə gəldiyi
+    dl = L.copy()
+    dah = dl["PAKET_DURUMU"].astype(str).str.upper().str.contains("DAH")
+    dl["TIP"] = np.select(
+        [dl["FORMTYPE"].isin([1, 2]) & ~dah, dl["FORMTYPE"].isin([1, 2]) & dah, dl["FORMTYPE"] == 3,
+         dl["FORMTYPE"].isin([4, 5])],
+        ["Pasiyentə satış (paketdən kənar)", "Paketə daxil (ayrıca satılmır)", dl["SINIF"].fillna("Digər çıxış"),
+         "Təchizat (şöbəyə verilən)"], default="Digər")
+    dl["XERCE_DAXIL"] = np.where(dl["TIP"].isin(["Pasiyentə satış (paketdən kənar)", "Paketə daxil (ayrıca satılmır)",
+                                                 "Şöbə sərfiyyatı"]), "Bəli", "Xeyr")
+    dl["D_SATIS"] = np.where(dl["TIP"] == "Pasiyentə satış (paketdən kənar)", dl["SATIS"], 0.0)
+    dl["QRUP_AD"] = dl["QRUP"].map(_qlabel)
+    dl["ODENIS_NOVU"] = dl["PAY"].map(PAY_LABEL).where(dl["FORMTYPE"].isin([1, 2]) & ~dah)
+    dl["ISTEYEN"] = dl["HSERVISADI"]
+    tord = {"Pasiyentə satış (paketdən kənar)": 0, "Paketə daxil (ayrıca satılmır)": 1, "Şöbə sərfiyyatı": 2,
+            "Korporativ məntəqə": 3, "İnventar yerdəyişməsi": 4, "Şöbələrarası ötürmə": 5, "Təchizat (şöbəyə verilən)": 6}
+    dl["_t"] = dl["TIP"].map(tord).fillna(9)
+    dl["_b"] = dl["FILIAL"].map(BRANCH_ORDER.index)
+    dl["_g"] = dl["QRUP"].map(lambda c: GROUP_ORDER.index(c) if c in GROUP_ORDER else 99)
+    summ = dl.groupby(["_b", "_g", "_t", "FILIAL", "QRUP_AD", "OBYEKT", "TIP", "XERCE_DAXIL"], dropna=False).agg(
+        SATIR=("SATIR", "sum"), D_SATIS=("D_SATIS", "sum"), MAYA=("MAYA", "sum")).reset_index()
+    summ = summ.sort_values(["_b", "_g", "_t", "MAYA"], ascending=[True, True, True, False]).drop(columns=["_b", "_g", "_t"])
+    det = dl.sort_values(["_b", "_g", "_t", "MAYA"], ascending=[True, True, True, False])
+    det = det[["FILIAL", "QRUP_AD", "OBYEKT", "TIP", "XERCE_DAXIL", "ISTEYEN", "DEPOADI", "CIKIS_YERI", "DERMAN_AD",
+               "BIRIM", "ODENIS_NOVU", "KURUM", "MIQDAR", "D_SATIS", "MAYA"]]
+    for c in ["ISTEYEN", "DEPOADI", "CIKIS_YERI", "DERMAN_AD", "BIRIM", "ODENIS_NOVU", "KURUM"]:
+        det[c] = det[c].fillna("—")
+    org = L[(L["DERMAN_GELIR"] != 0) & L["PAY"].isin(["SIG", "ITS", "KORP"])]
+    org = org.groupby(["FILIAL", "PAY", "KURUM"], dropna=False)["DERMAN_GELIR"].sum().reset_index().rename(
+        columns={"DERMAN_GELIR": "DERMAN_TESKILAT"})
+    return {"lvl": lvl, "top": top, "dest": pd.concat(dests, ignore_index=True) if dests else pd.DataFrame(),
+            "bal": pd.DataFrame(bal), "lines": L, "org": org, "summ": summ, "det": det,
+            "p12": _aidiyyet_data(p12_all), "aid": _aidiyyet_compare(p12_all)}
+
+
+def _aidiyyet_data(parts):
+    """'Dərman — Məlumat' vərəqi: pasiyentə çıxışlar, hər iki aidiyyət qaydası üçün sütunlarla."""
+    if not parts:
+        return pd.DataFrame()
+    d = pd.concat(parts, ignore_index=True)
+    keys = ["FILIAL", "ISTEYEN", "I_QRUP_AD", "DEPOADI", "V_QRUP_AD", "PAKET", "ODENIS_NOVU"]
+    for k in keys:
+        d[k] = d[k].astype(object).where(d[k].notna(), "\x00")
+    g = d.groupby(keys).agg(SATIR=("SATIR", "sum"), D_SATIS=("SATIS", "sum"), MAYA=("MAYA", "sum")).reset_index()
+    for k in keys:
+        g[k] = g[k].replace("\x00", None)
+    g["D_SATIS"] = np.where(g["PAKET"] == "Paketə daxil", 0.0, g["D_SATIS"]).round(2)
+    g["MAYA"] = g["MAYA"].round(2)
+    g["_b"] = g["FILIAL"].map(BRANCH_ORDER.index)
+    return g.sort_values(["_b", "I_QRUP_AD", "ISTEYEN", "D_SATIS"], ascending=[True, True, True, False],
+                         na_position="last").drop(columns=["_b"])
+
+
+def _aidiyyet_compare(parts):
+    """Hər filial × bölmə üçün iki qaydanın nəticəsi və fərqin hansı şöbə/depo axınlarından yarandığı."""
+    if not parts:
+        return pd.DataFrame()
+    d = pd.concat(parts, ignore_index=True)
+    k = d[d["PAKET"] == "Paketdən kənar"]
+    rows = []
+    for b in BRANCH_ORDER:
+        kb, db = k[k["FILIAL"] == b], d[d["FILIAL"] == b]
+        for g in GROUP_ORDER:
+            lab = GROUP_LABEL[g]
+            i_s, v_s = kb.loc[kb["I_QRUP_AD"] == lab, "SATIS"].sum(), kb.loc[kb["V_QRUP_AD"] == lab, "SATIS"].sum()
+            i_m, v_m = db.loc[db["I_QRUP_AD"] == lab, "MAYA"].sum(), db.loc[db["V_QRUP_AD"] == lab, "MAYA"].sum()
+            if not any([i_s, v_s, i_m, v_m]):
+                continue
+            out_ = kb[(kb["I_QRUP_AD"] == lab) & (kb["V_QRUP_AD"] != lab)].groupby(["ISTEYEN", "DEPOADI"])["SATIS"].sum()
+            in_ = kb[(kb["V_QRUP_AD"] == lab) & (kb["I_QRUP_AD"] != lab)].groupby(["DEPOADI", "ISTEYEN"])["SATIS"].sum()
+            txt = []
+            for (sh, dp), v in out_.sort_values(ascending=False).head(3).items():
+                if v >= 1:
+                    txt.append(f"{sh} şöbəsi dərmanı {dp} deposundan alıb ({fmt_az(v)} AZN) — yalnız 'İstəyən şöbə' qaydasında bölməyə düşür")
+            for (dp, sh), v in in_.sort_values(ascending=False).head(3).items():
+                if v >= 1:
+                    txt.append(f"{dp} deposu {sh} şöbəsinin pasiyentlərinə verib ({fmt_az(v)} AZN) — yalnız 'Verən depo' qaydasında bölməyə düşür")
+            rows.append({"FILIAL": b, "QRUP_AD": lab, "I_SATIS": round(i_s, 2), "V_SATIS": round(v_s, 2),
+                         "I_MAYA": round(i_m, 2), "V_MAYA": round(v_m, 2),
+                         "AIDIYYET_IZAH": "; ".join(txt) if txt else "Bütün dərmanlar bölmənin öz depolarından verilib — iki qayda eynidir"})
+    return pd.DataFrame(rows)
+
+
+GROUP_SUBTOTAL = "Bölmə cəmi"
+
+
+def build_drug_composition(met):
+    """Hər bölməyə hansı şöbə və depoların birləşdirildiyini və hər birinin dərman payını göstərir."""
+    if met is None or met.empty:
+        return pd.DataFrame()
+    S = met[met["SEVIYYE"] == "S"].set_index(["FILIAL", "OBYEKT"])
+    cols = ["DERMAN_GELIR", "DERMAN_MAYA", "PAKET_MAYA", "SERFIYYAT", "TECHIZAT"]
+    rows = []
+    for b in BRANCH_ORDER:
+        cfg = BRANCHES[b]
+        for g in GROUP_ORDER:
+            members = [(n, "Şöbə") for n in cfg["groups"].get(g, [])] + \
+                      [(n, "Depo") for n in cfg.get("depots", {}).get(g, [])]
+            if not members:
+                continue
+            part = []
+            for n, kind in members:
+                v = {c: float(S.loc[(b, n), c]) if (b, n) in S.index and c in S else 0.0 for c in cols}
+                part.append({"FILIAL": b, "QRUP_AD": GROUP_LABEL[g], "OBYEKT": n, "NOV": kind, **v})
+            pdf = pd.DataFrame(part)
+            pdf["DERMAN_XERC"] = pdf["DERMAN_MAYA"] + pdf["PAKET_MAYA"] + pdf["SERFIYYAT"]
+            tot = pdf["DERMAN_XERC"].sum()
+            pdf["QRUP_PAY"] = pdf["DERMAN_XERC"] / tot if tot else 0.0
+            pdf = pdf.sort_values(["DERMAN_XERC", "DERMAN_GELIR"], ascending=False)
+            sub = {"FILIAL": b, "QRUP_AD": GROUP_LABEL[g], "OBYEKT": f"{GROUP_LABEL[g]} — cəmi ({len(members)} şöbə/depo)",
+                   "NOV": GROUP_SUBTOTAL, **{c: pdf[c].sum() for c in cols + ["DERMAN_XERC"]}, "QRUP_PAY": 1.0 if tot else 0.0}
+            rows.append(pd.concat([pdf, pd.DataFrame([sub])], ignore_index=True))
+    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+
+
+def build_model(data, status, start, end_incl):
+    def cat(name):
+        parts = [d[name].assign(FILIAL=b) for b, d in data.items() if name in d and not d[name].empty]
+        return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+
+    m = {}
+    met = cat("met")
+    if not met.empty:
+        for c in ["HOSP_SAYI", "TAXIS_SAYI", "HELE_YATAN", "ORTA_YATIS"]:
+            met[c] = pd.to_numeric(met[c], errors="coerce").fillna(0)
+    drug = build_drug(data)
+    m["drug"] = drug
+    # həkim qazancı — şöbə/bölmə/filial səviyyəsində (toplanan göstəricidir)
+    hk_parts = []
+    for b, d in data.items():
+        h = d.get("hak")
+        if h is None or h.empty:
+            continue
+        h = h.copy()
+        h["QRUP"] = h["SR_ADI"].map(name_to_group(BRANCHES[b]))
+        h = h[h["QRUP"].notna()]
+        for c in ["HK_YAPAN", "HK_GONDEREN"]:
+            h[c] = pd.to_numeric(h[c], errors="coerce").fillna(0.0)
+        hk_parts.append(pd.concat([h.assign(SEVIYYE="S", OBYEKT=h["SR_ADI"]), h.assign(SEVIYYE="Q", OBYEKT=h["QRUP"]),
+                                   h.assign(SEVIYYE="F", OBYEKT="ALL", QRUP="ALL")]).assign(FILIAL=b))
+    m["has_hak"] = bool(hk_parts)
+    if not met.empty:
+        if hk_parts:
+            hk = pd.concat(hk_parts).groupby(["FILIAL", "SEVIYYE", "OBYEKT"]).agg(
+                QRUP_H=("QRUP", "max"), HK_YAPAN=("HK_YAPAN", "sum"), HK_GONDEREN=("HK_GONDEREN", "sum")).reset_index()
+            met = met.merge(hk, on=["FILIAL", "SEVIYYE", "OBYEKT"], how="outer")
+            met["QRUP"] = met["QRUP"].fillna(met["QRUP_H"])
+            met = met.drop(columns=["QRUP_H"])
+        for c in ["HK_YAPAN", "HK_GONDEREN"]:
+            met[c] = pd.to_numeric(met[c], errors="coerce").fillna(0.0) if c in met else 0.0
+    if not met.empty and drug:
+        met = met.merge(drug["lvl"], on=["FILIAL", "SEVIYYE", "OBYEKT"], how="outer")
+        met["QRUP"] = met["QRUP"].fillna(met["QRUP_D"])
+        met = met.drop(columns=["QRUP_D"])
+        num = [c for c in met.columns if c not in ("FILIAL", "SEVIYYE", "OBYEKT", "QRUP")]
+        met[num] = met[num].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+    if not met.empty:
+        for c in DRUG_MEASURES:
+            if c not in met:
+                met[c] = 0.0
+        met["QRUP_AD"] = met["QRUP"].map(_qlabel)
+        met = _derive(met)
+    m["met"] = met
+    m["drug_comp"] = build_drug_composition(met)
+    m["cmp"] = _order(met[met["SEVIYYE"].isin(["Q", "F"])]) if not met.empty else met
+    dept = met[met["SEVIYYE"] == "S"].rename(columns={"OBYEKT": "SR_ADI"}) if not met.empty else met
+    m["dept"] = _order(dept, by_group_first=False) if not dept.empty else dept
+
+    hek = cat("hekim")
+    if not hek.empty:
+        hek["QRUP_AD"] = hek["QRUP"].map(_qlabel)
+        hek["PERSADI"] = hek["PERSADI"].fillna("— Həkim qeyd olunmayıb —")
+        hek["PERSKODU"] = hek["PERSKODU"].map(lambda v: "—" if pd.isna(v) else str(v).strip())
+        dh = cat("drug_hekim")
+        if not dh.empty:
+            dh["PERSKODU"] = dh["PERSKODU"].map(lambda v: "—" if pd.isna(v) else str(v).strip())
+            # ehtiyat üsul: kod yoxdur -> eyni filial və şöbədə həkim adına görə xidmət həkiminin kodu tapılır
+            nm = lambda x: " ".join(_norm(x).split())
+            lookup = {(r.FILIAL, r.SR_ADI, nm(r.PERSADI)): r.PERSKODU for r in hek.itertuples() if r.PERSKODU != "—"}
+            nokod = (dh["PERSKODU"] == "—") & dh["HDOKTORADI"].notna()
+            dh.loc[nokod, "PERSKODU"] = [lookup.get((f, sr, nm(a)), "AD:" + nm(a)) for f, sr, a in
+                                         dh.loc[nokod, ["FILIAL", "SR_ADI", "HDOKTORADI"]].itertuples(index=False)]
+            dah = dh["PAKET_DURUMU"].astype(str).str.upper().str.contains("DAH")
+            dh["DERMAN_GELIR"] = pd.to_numeric(dh["SATIS"], errors="coerce").fillna(0).where(~dah, 0.0)
+            dh["DERMAN_MAYA"] = pd.to_numeric(dh["MAYA"], errors="coerce").fillna(0).where(~dah, 0.0)
+            dh = dh.groupby(["FILIAL", "SR_ADI", "PERSKODU"]).agg(
+                HDOKTORADI=("HDOKTORADI", "max"), DERMAN_GELIR=("DERMAN_GELIR", "sum"),
+                DERMAN_MAYA=("DERMAN_MAYA", "sum")).reset_index()
+            hek = hek.merge(dh, on=["FILIAL", "SR_ADI", "PERSKODU"], how="outer")
+            hek["PERSADI"] = hek["PERSADI"].fillna(hek["HDOKTORADI"]).fillna("— Həkim qeyd olunmayıb —")
+            n2g = {d: g for b in BRANCHES.values() for g, ds in b["groups"].items() for d in ds}
+            hek["QRUP"] = hek["QRUP"].fillna(hek["SR_ADI"].map(n2g))
+            hek["QRUP_AD"] = hek["QRUP"].map(_qlabel)
+            hek = hek.drop(columns=["HDOKTORADI"])
+        hh = cat("hak_hekim")
+        if not hh.empty:
+            hh["PERSKODU"] = hh["PERSKODU"].map(lambda v: "—" if pd.isna(v) else str(v).strip())
+            nm = lambda x: " ".join(_norm(x).split())
+            lookup = {(r.FILIAL, r.SR_ADI, nm(r.PERSADI)): r.PERSKODU for r in hek.itertuples() if r.PERSKODU != "—"}
+            nokod = (hh["PERSKODU"] == "—") & hh["HDOKTORADI"].notna()
+            hh.loc[nokod, "PERSKODU"] = [lookup.get((f, sr, nm(a)), "AD:" + nm(a)) for f, sr, a in
+                                         hh.loc[nokod, ["FILIAL", "SR_ADI", "HDOKTORADI"]].itertuples(index=False)]
+            for c in ["HK_YAPAN", "HK_GONDEREN"]:
+                hh[c] = pd.to_numeric(hh[c], errors="coerce").fillna(0.0)
+            hh = hh.groupby(["FILIAL", "SR_ADI", "PERSKODU"]).agg(
+                HDOKTORADI=("HDOKTORADI", "max"), HK_YAPAN=("HK_YAPAN", "sum"), HK_GONDEREN=("HK_GONDEREN", "sum")).reset_index()
+            hek = hek.merge(hh, on=["FILIAL", "SR_ADI", "PERSKODU"], how="outer")
+            hek["PERSADI"] = hek["PERSADI"].fillna(hek["HDOKTORADI"]).fillna("— Həkim qeyd olunmayıb —")
+            n2g = {d: g for b in BRANCHES.values() for g, ds in b["groups"].items() for d in ds}
+            hek["QRUP"] = hek["QRUP"].fillna(hek["SR_ADI"].map(n2g))
+            hek["QRUP_AD"] = hek["QRUP"].map(_qlabel)
+            hek = hek.drop(columns=["HDOKTORADI"])
+            num = [c for c in hek.columns if c not in ("FILIAL", "SR_ADI", "PERSKODU", "PERSADI", "QRUP", "QRUP_AD")]
+            hek[num] = hek[num].apply(pd.to_numeric, errors="coerce").fillna(0)
+            for c in ["CEMI_QEBUL", "UNIKAL_PASIYENT", "XIDMET_SATIRI", "SATIS", "NAGD", "SIGORTA", "ITS", "KORPORATIV",
+                      "DERMAN_GELIR", "DERMAN_MAYA"]:
+                hek[c] = pd.to_numeric(hek[c], errors="coerce").fillna(0)
+        hek = _derive(hek)
+        hek["_g"] = hek["QRUP"].map(lambda c: GROUP_ORDER.index(c) if c in GROUP_ORDER else 99)
+        hek["_b"] = hek["FILIAL"].map(BRANCH_ORDER.index)
+        hek = hek.sort_values(["_b", "_g", "SR_ADI", "SATIS"], ascending=[True, True, True, False]).drop(columns=["_g", "_b"])
+        hek["SOBE_PAY"] = _div(hek["SATIS"], hek.groupby(["FILIAL", "SR_ADI"])["SATIS"].transform("sum"))
+        hek["SOBE_RANK"] = hek.groupby(["FILIAL", "SR_ADI"])["SATIS"].rank(ascending=False, method="min").astype(int)
+    m["hekim"] = hek
+
+    ay = cat("ay")
+    if not ay.empty:
+        ay["AY"] = pd.to_datetime(ay["AY"])
+        ay["QRUP_AD"] = ay["QRUP"].map(_qlabel)
+        ay["GUN"] = ay["AY"].map(lambda a: month_days(a, start, end_incl))
+        ay["AY_AD"] = ay["AY"].map(lambda a: f"{a.year}-{a.month:02d} {AZ_MONTHS[a.month - 1]}")
+        ay["SATIS"] = pd.to_numeric(ay["SATIS"]).round(2)
+        ay["GUNLUK_SATIS"] = _div(ay["SATIS"], ay["GUN"])
+        ay["GUNLUK_QEBUL"] = _div(ay["CEMI_QEBUL"], ay["GUN"])
+        ay["ORTA_CEK"] = _div(ay["SATIS"], ay["CEMI_QEBUL"])
+        ay["_b"] = ay["FILIAL"].map(BRANCH_ORDER.index)
+        ay["_g"] = ay["QRUP"].map(lambda c: GROUP_ORDER.index(c) if c in GROUP_ORDER else 99)
+        ay = ay.sort_values(["_b", "_g", "AY"]).drop(columns=["_b", "_g"])
+    m["ay"] = ay
+
+    for k in ["geden", "gelen"]:
+        df = cat(k)
+        if not df.empty:
+            df["QRUP_AD"] = df["QRUP"].map(_qlabel)
+            df = _derive(df)
+            df = df.sort_values(["FILIAL", "SATIS"], ascending=[True, False])
+            for c in ["ITU_ADI", "IT_ADI"]:
+                if c in df:
+                    df[c] = df[c].fillna("—")
+        m[k] = df
+
+    ox = cat("org_xidmet")
+    od = (drug or {}).get("org", pd.DataFrame())
+    org = pd.DataFrame()
+    if not ox.empty or not od.empty:
+        if not ox.empty:
+            ox["KURUM"] = ox["KURUM"].fillna("—")
+        if not od.empty:
+            od = od.copy(); od["KURUM"] = od["KURUM"].fillna("—")
+        org = ox if od.empty else (od if ox.empty else ox.merge(od, on=["FILIAL", "PAY", "KURUM"], how="outer"))
+        for c in ["CEMI_QEBUL", "UNIKAL_PASIYENT", "TESKILAT_XIDMET", "PASIYENT_XIDMET", "DERMAN_TESKILAT"]:
+            org[c] = pd.to_numeric(org[c], errors="coerce").fillna(0.0) if c in org else 0.0
+        org["TESKILAT_CEMI"] = org["TESKILAT_XIDMET"] + org["DERMAN_TESKILAT"]
+        org["ORG_PAY"] = _div(org["TESKILAT_CEMI"], org.groupby("FILIAL")["TESKILAT_CEMI"].transform("sum"))
+        org["ODENIS_NOVU"] = org["PAY"].map(PAY_LABEL)
+        org["_b"] = org["FILIAL"].map(BRANCH_ORDER.index)
+        org["_p"] = org["PAY"].map({"SIG": 0, "ITS": 1, "KORP": 2})
+        org = org.sort_values(["_b", "_p", "TESKILAT_CEMI"], ascending=[True, True, False]).drop(columns=["_b", "_p"])
+    m["org"] = org
+    m["dq"] = build_dq(data, status, m, end_incl)
+    m["status"] = status
+    return m
+
+
+def build_dq(data, status, m, end_incl):
+    OK, WARN, ERR, INFO = "✔ Uğurlu", "⚠ Diqqət", "✖ Xəta", "ℹ Məlumat"
+    rows = []
+
+    def add(b, name, exp, fact, res, note=""):
+        diff = (fact - exp) if isinstance(exp, (int, float)) and isinstance(fact, (int, float)) else None
+        rows.append({"FILIAL": b, "YOXLAMA": name, "GOZLENILEN": exp, "FAKTIKI": fact, "FERQ": diff,
+                     "NETICE": res, "SERH": note})
+
+    met, hek = m["met"], m["hekim"]
+    for st in status:
+        b = st["FILIAL"]
+        if not st["OK"]:
+            add(b, "Məlumatların alınması", "Alındı", "Alınmadı", ERR, "Filial hesabata daxil DEYİL — səbəb konsol çıxışındadır")
+            continue
+        add(b, "Məlumatların alınması", "Alındı", "Alındı", OK, f"{st['SANIYE']} san")
+        for qn, how in st.get("NOTES", []):
+            label = {"drug": "Dərman çıxışı", "drug_hekim": "Həkim üzrə dərman", "missed": "Oxşar adlı şöbə axtarışı",
+                     "org_xidmet": "Təşkilatlar üzrə satış", "kurum": "Təşkilat adı",
+                     "klinik": "Klinik şöbələr siyahısı", "hak": "Həkim qazancı",
+                     "hak_hekim": "Həkim üzrə qazanc", "hak_kod": "Həkim qazancında həkim kodu"}.get(qn, qn)
+            if how == "alt":
+                txt = {"drug_hekim": "Bu filialın bazasında həkim kodu yoxdur — dərman həkimə ad üzrə bağlanıb",
+                       "hak_kod": "Həkim qazancı həkimə ad üzrə bağlanıb (view-da həkim kodu yoxdur)"}.get(
+                    qn, "Təşkilat adı sütunu yoxdur — ödəniş növü pasiyent sinfi üzrə təyin olunub")
+                add(b, f"{label} məlumatı", "Əsas üsul", "Ehtiyat üsul", INFO, txt)
+            else:
+                add(b, f"{label} məlumatı", "Alındı", "Alınmadı", WARN,
+                    "Bu göstərici filial üzrə boş qalıb — səbəb konsol çıxışındadır")
+        mb = met[met["FILIAL"] == b]
+        tot = mb[mb["SEVIYYE"] == "F"]
+        if tot.empty:
+            add(b, "Dövr üzrə məlumat", "> 0 sətir", "0", WARN, "Seçilmiş şöbələrdə xidmət tapılmadı")
+            continue
+        t = tot.iloc[0]
+        S = round(float(t["SATIS"]), 2)
+        tol = max(0.05, 0.006 * int((mb["SEVIYYE"] == "S").sum()))  # yuvarlaqlaşdırma payı
+
+        def eq(name, exp, fact, note):
+            add(b, name, round(exp, 2), round(fact, 2), OK if abs(fact - exp) <= tol else ERR, note)
+
+        eq("Ödəniş bölgüsü: Nağd + Sığorta + İTS + Korporativ = Xidmət satışı", S,
+           float(t["NAGD"] + t["SIGORTA"] + t.get("ITS", 0) + t["KORPORATIV"]), "Hər manat bir ödəniş mənbəyinə aiddir")
+        org = m.get("org", pd.DataFrame())
+        if not org.empty and "TESKILAT_XIDMET" in org and (org["FILIAL"] == b).any():
+            eq("Təşkilatlar cəmi (xidmət) = Sığorta + İTS + Korporativ", float(t["SIGORTA"] + t.get("ITS", 0) + t["KORPORATIV"]),
+               float(org.loc[org["FILIAL"] == b, "TESKILAT_XIDMET"].sum()), "Hər təşkilat payı bir ödəniş növünə aiddir")
+        add(b, "Yeni + Təkrar = Cəmi qəbul", int(t["CEMI_QEBUL"]), int(t["YENI_QEBUL"] + t["TEKRAR_QEBUL"]),
+            OK if int(t["YENI_QEBUL"] + t["TEKRAR_QEBUL"]) == int(t["CEMI_QEBUL"]) else ERR, "Hər qəbul ya yeni, ya təkrardır")
+        eq("Şöbələr cəmi satış = Filial cəmi", S, float(mb.loc[mb["SEVIYYE"] == "S", "SATIS"].sum()),
+           "Satış toplanan göstəricidir — şöbələr üzrə cəm filial cəminə bərabər olmalıdır")
+        eq("Bölmə qrupları cəmi satış = Filial cəmi", S, float(mb.loc[mb["SEVIYYE"] == "Q", "SATIS"].sum()),
+           "Hər şöbə yalnız bir qrupa aiddir")
+        if not hek.empty:
+            eq("Həkimlər vərəqi cəmi = Filial cəmi", S, float(hek.loc[hek["FILIAL"] == b, "SATIS"].sum()),
+               "Həkimi qeyd olunmayan sətirlər daxil")
+        dq = data[b]["dq"].iloc[0] if not data[b]["dq"].empty else None
+        if dq is not None:
+            eq("Ayrıca nəzarət hesablaması ilə satış uyğunluğu", S, float(dq["SATIS"] or 0),
+               "Müstəqil hesablama eyni məbləği verməlidir")
+        dif = int(t["CEMI_QEBUL"] - t["AMB_QEBUL"] - t["STAS_QEBUL"])
+        add(b, "Ambulator + Stasionar = Cəmi qəbul", int(t["CEMI_QEBUL"]), int(t["AMB_QEBUL"] + t["STAS_QEBUL"]),
+            OK if dif == 0 else WARN, "" if dif == 0 else f"{dif} qəbulun xəstə tipi (ambulator/stasionar) təyin olunmayıb")
+        if dq is not None:
+            sh = float(dq["HEKIMSIZ_SATIS"] or 0) / S if S else 0
+            add(b, "Həkimi qeyd olunmayan satış payı", "≤ 5%", f"{sh:.1%}", OK if sh <= 0.05 else WARN,
+                f"{fmt_az(int(dq['HEKIMSIZ_SATIR'] or 0))} sətir, {fmt_az(float(dq['HEKIMSIZ_SATIS'] or 0), 2)} AZN")
+            sh2 = float(dq["ISERVIS_BOS"] or 0) / float(dq["SATIR"] or 1)
+            add(b, "Göndərən şöbəsi boş xidmətlər", "—", f"{sh2:.1%}", INFO,
+                "Birbaşa müraciət; 'Daxil olan yönləndirmələr'ə daxil edilmir")
+            mn = int(dq["MENFI_SATIR"] or 0)
+            add(b, "Mənfi məbləğli (storno/qaytarma) sətirlər", 0, mn, OK if mn == 0 else WARN,
+                f"Cəmi {fmt_az(float(dq['MENFI_MEBLEG'] or 0), 2)} AZN — satışdan çıxılıb" if mn else "")
+            son = pd.to_datetime(dq["SON_TARIX"])
+            add(b, "Son xidmət tarixi (aktuallıq)", end_incl.strftime("%d.%m.%Y"),
+                son.strftime("%d.%m.%Y %H:%M") if pd.notna(son) else "—",
+                OK if pd.notna(son) and son.date() >= end_incl.date() else WARN,
+                "Dövrün son günü üzrə məlumat var" if pd.notna(son) and son.date() >= end_incl.date() else "Son gün(lər) üzrə məlumat yoxdur")
+        found = set(mb.loc[mb["SEVIYYE"] == "S", "OBYEKT"])
+        miss = [d for d in all_depts(BRANCHES[b]) if d not in found]
+        add(b, "Konfiqurasiyadakı şöbələrin məlumatda tapılması", len(all_depts(BRANCHES[b])), len(found),
+            OK if not miss else INFO, ("Dövrdə xidməti olmayan: " + ", ".join(miss)) if miss else "Bütün şöbələr tapıldı")
+        ms = data[b].get("missed")
+        if ms is not None and not ms.empty:
+            ms = ms.sort_values("SATIS", ascending=False)
+            txt = "; ".join(f"{r.SR_ADI} ({fmt_az(float(r.SATIS))} AZN)" for r in ms.head(8).itertuples())
+            add(b, "Hesabata daxil edilməyən oxşar adlı şöbələr", 0, len(ms), WARN, txt + " — daxil edilməli olub-olmadığını yoxlayın")
+        else:
+            add(b, "Hesabata daxil edilməyən oxşar adlı şöbələr", 0, 0, OK, "Tapılmadı")
+        add(b, "Hələ stasionarda olan pasiyentlər", "—", int(t["HELE_YATAN"]), INFO,
+            "Orta yatış müddətinə daxil edilməyib (müalicə davam edir)")
+        # --- dərman ---
+        dr = m.get("drug") or {}
+        if not dr:
+            add(b, "Dərman çıxışı məlumatı", "> 0", 0, WARN, "Dərman sorğusu nəticə qaytarmadı")
+            continue
+        eq("Dərman: şöbələr cəmi xərc = Filial cəmi", float(t["DERMAN_XERC"]),
+           float(mb.loc[mb["SEVIYYE"] == "S", "DERMAN_XERC"].sum()), "Dərman xərci toplanan göstəricidir")
+        eq("Dərman: bölmələr cəmi satış = Filial cəmi", float(t["DERMAN_GELIR"]),
+           float(mb.loc[mb["SEVIYYE"] == "Q", "DERMAN_GELIR"].sum()), "Hər şöbə/depo yalnız bir bölməyə aiddir")
+        dc = m.get("drug_comp", pd.DataFrame())
+        if not dc.empty:
+            eq("Dərman bölmə tərkibi cəmi = Filial dərman xərci", float(t["DERMAN_XERC"]),
+               float(dc.loc[(dc["FILIAL"] == b) & (dc["NOV"] == GROUP_SUBTOTAL), "DERMAN_XERC"].sum()),
+               "Bölmələrə daxil edilən şöbə/depo siyahısı xərcin hamısını izah edir")
+        if m.get("has_hak"):
+            eq("Həkim qazancı: şöbələr cəmi = Filial cəmi", float(t["HEKIM_QAZANC"]),
+               float(mb.loc[mb["SEVIYYE"] == "S", "HEKIM_QAZANC"].sum()), "Həkim qazancı toplanan göstəricidir")
+        p12 = dr.get("p12", pd.DataFrame())
+        if not p12.empty:
+            pb = p12[(p12["FILIAL"] == b) & (p12["PAKET"] == "Paketdən kənar") & p12["I_QRUP_AD"].notna()]
+            eq("'Dərman — Məlumat' vərəqi (istəyən şöbə qaydası) = Dərman satışı", float(t["DERMAN_GELIR"]),
+               float(pb["D_SATIS"].sum()), "Excel-dəki seçim düsturları modellə eyni nəticəni verir")
+        sm = dr.get("summ", pd.DataFrame())
+        if not sm.empty:
+            eq("Dərman sərfi mənbə cədvəli (xərcə daxil) = Cəmi dərman xərci", float(t["DERMAN_XERC"]),
+               float(sm.loc[(sm["FILIAL"] == b) & (sm["XERCE_DAXIL"] == "Bəli"), "MAYA"].sum()),
+               "'Dərman sərfi — mənbə' vərəqi paneldəki rəqəmi tam izah edir")
+        eq("Dərman ödəniş bölgüsü: Nağd + Sığorta + İTS + Korporativ = Dərman satışı", float(t["DERMAN_GELIR"]),
+           float(t["DERMAN_NAGD"] + t["DERMAN_SIG"] + t["DERMAN_ITS"] + t["DERMAN_KORP"]), "")
+        if float(t["DERMAN_GELIR"]) > 0 and float(t["MARJA_PAY"]) < 0:
+            add(b, "Dərman marjası", "≥ 0%", f"{float(t['MARJA_PAY']):.1%}", WARN, "Satış qiyməti maya dəyərindən aşağıdır")
+        bl = dr["bal"][dr["bal"]["FILIAL"] == b] if not dr["bal"].empty else dr["bal"]
+        for r_ in bl.itertuples():
+            tc, dc, cr = r_.TECHIZAT, r_.DEPO_CIXIS, r_.BASQA_SOBEYE
+            ratio = dc / tc if tc else None
+            low = tc >= 1000 and ratio is not None and ratio < 0.5
+            note = (f"Depoya verilənin {ratio:.0%}-i çıxılıb" if ratio is not None else "Dövrdə təchizat olmayıb")
+            if low:
+                note += " — qalan ya depoda stok kimi qalıb, ya da çıxış FONET-də vaxtında rəsmiləşdirilməyib"
+            if cr > 0:
+                note += f"; depodan başqa şöbələrin pasiyentlərinə {fmt_az(cr, 2)} AZN verilib (onların xərcinə yazılıb)"
+            add(b, f"Dərman depo balansı — {_qlabel(r_.QRUP)}: təchizat vs çıxış", round(tc, 2), round(dc, 2),
+                WARN if low else INFO, note)
+        tf = float(t.get("TESNIFSIZ", 0))
+        if tf:
+            dd = dr["dest"]
+            names = (dd[(dd["FILIAL"] == b) & (dd["SINIF"] == "Təsnif olunmayıb")].groupby("CIKIS_YERI")["MAYA"].sum()
+                     .sort_values(ascending=False).reset_index())
+            add(b, "Dərman: təsnif olunmayan çıxış istiqamətləri", 0, round(tf, 2), WARN,
+                "Xərcə daxil edilməyib: " + "; ".join(f"{r_.CIKIS_YERI} ({fmt_az(r_.MAYA)} AZN)" for r_ in names.head(6).itertuples())
+                + " — lazım olsa açar sözü skriptdə DRUG_*_KEYS siyahısına əlavə edin")
+        for k, c in [("İnventar yerdəyişməsi (xərcə daxil deyil)", "INV_CIXIS"),
+                     ("Şöbələrarası ötürmə (xərcə daxil deyil)", "OTURME"),
+                     ("Korporativ məntəqələrə çıxış (ayrıca göstərilir)", "KORP_MENTEQE")]:
+            add(b, "Dərman: " + k, "—", round(float(t[c]), 2), INFO, "İstiqamətlər — 'Dərman istiqamətləri' vərəqində")
+    return pd.DataFrame(rows)
+
+
+# =====================================================================================
+# 6. EXCEL DİZAYNI
+# =====================================================================================
+FONT = "Arial"
+C_NAVY, C_NAVY2, C_ACCENT = "14213D", "1F3A68", "2F80ED"
+C_GRID, C_ZEBRA, C_TOTAL, C_MUTED = "D9DEE7", "F5F7FB", "E3ECFA", "6B7280"
+BRANCH_COLORS = {"Babək": "2F5597", "Mərkəz": "00A3A1", "Medilux": "F28E2B"}
+PAY_COLORS = ["4E79A7", "59A14F", "B07AA1", "EDC948"]
+
+FMT = {
+    "money": '#,##0.00;[Red]-#,##0.00;"–"',
+    "money0": '#,##0;[Red]-#,##0;"–"',
+    "int": '#,##0;[Red]-#,##0;"–"',
+    "pct": '0.0%;[Red]-0.0%;"–"',
+    "dec1": '0.0;[Red]-0.0;"–"',
+    "text": "@",
+}
+
+COLS = {
+    "FILIAL": ("Filial", "text"),
+    "QRUP_AD": ("Bölmə qrupu", "text"),
+    "SR_ADI": ("Şöbə", "text"),
+    "AMB_QEBUL": ("Ambulator qəbul", "int"),
+    "STAS_QEBUL": ("Stasionar qəbul", "int"),
+    "CEMI_QEBUL": ("Cəmi qəbul", "int"),
+    "UNIKAL_PASIYENT": ("Unikal pasiyent", "int"),
+    "YENI_QEBUL": ("Yeni pasiyent (ilk müraciət)", "int"),
+    "TEKRAR_QEBUL": ("Təkrar müraciət", "int"),
+    "YENI_PAY": ("Yeni pasiyent payı", "pct"),
+    "HEKIM_SAYI": ("Aktiv həkim sayı", "int"),
+    "XIDMET_SATIRI": ("Göstərilən xidmət sayı", "int"),
+    "SATIS": ("Xidmət satışı (AZN)", "money"),
+    "NAGD": ("Nağd — pasiyent payı (AZN)", "money"),
+    "SIGORTA": ("Sığorta (AZN)", "money"),
+    "ITS": ("İcbari tibbi sığorta (AZN)", "money"),
+    "ITS_PAY": ("İTS payı", "pct"),
+    "KORPORATIV": ("Korporativ / digər qurum (AZN)", "money"),
+    "NAGD_PAY": ("Nağd payı", "pct"),
+    "SIG_PAY": ("Sığorta payı", "pct"),
+    "KORP_PAY": ("Korporativ payı", "pct"),
+    "ORTA_CEK": ("Orta çek (AZN)", "money"),
+    "HOSP_SAYI": ("Hospitalizasiya", "int"),
+    "TAXIS_SAYI": ("Evə yazılan", "int"),
+    "HELE_YATAN": ("Hələ stasionarda", "int"),
+    "ORTA_YATIS": ("Orta yatış müddəti (gün)", "dec1"),
+    "HEKIM_BASI_QEBUL": ("Həkim başına qəbul", "dec1"),
+    "HEKIM_BASI_SATIS": ("Həkim başına satış (AZN)", "money"),
+    "FILIAL_PAY": ("Filial satışında payı", "pct"),
+    "PERSKODU": ("Həkim kodu", "text"),
+    "PERSADI": ("Həkim", "text"),
+    "SOBE_PAY": ("Şöbə satışında payı", "pct"),
+    "SOBE_RANK": ("Şöbədə yeri", "int"),
+    "AY_AD": ("Ay", "text"),
+    "GUN": ("Dövrə düşən gün", "int"),
+    "GUNLUK_SATIS": ("Gündəlik orta satış (AZN)", "money"),
+    "GUNLUK_QEBUL": ("Gündəlik orta qəbul", "dec1"),
+    "GONDEREN_SOBE": ("Göndərən şöbə", "text"),
+    "ICRACI_SOBE": ("İcraçı şöbə", "text"),
+    "QEBUL_EDEN_SOBE": ("Qəbul edən şöbə", "text"),
+    "ITU_ADI": ("Xidmət üst qrupu", "text"),
+    "IT_ADI": ("Xidmət tipi", "text"),
+    "DERMAN_GELIR": ("Dərman satışı (AZN)", "money"),
+    "DERMAN_NAGD": ("Dərman — nağd (AZN)", "money"),
+    "DERMAN_SIG": ("Dərman — sığorta (AZN)", "money"),
+    "DERMAN_ITS": ("Dərman — İTS (AZN)", "money"),
+    "DERMAN_KORP": ("Dərman — korporativ (AZN)", "money"),
+    "DERMAN_NAGD_PAY": ("Dərman — nağd payı", "pct"),
+    "DERMAN_SIG_PAY": ("Dərman — sığorta payı", "pct"),
+    "DERMAN_ITS_PAY": ("Dərman — İTS payı", "pct"),
+    "DERMAN_KORP_PAY": ("Dərman — korporativ payı", "pct"),
+    "HK_YAPAN": ("Həkim qazancı — icra (AZN)", "money"),
+    "HK_GONDEREN": ("Həkim qazancı — göndərən (AZN)", "money"),
+    "HEKIM_QAZANC": ("Həkim qazancı cəmi (AZN)", "money"),
+    "HEKIM_PAY": ("Həkim qazancının satışda payı", "pct"),
+    "DOVRIYYE": ("Xalis dövriyyə (AZN)", "money"),
+    "DOVRIYYE_MARJA": ("Dövriyyə marjası", "pct"),
+    "DOVRIYYE_QEBUL": ("Qəbul başına xalis dövriyyə (AZN)", "money"),
+    "ODENIS_NOVU": ("Ödəniş növü", "text"),
+    "ISTEYEN": ("İstəyən şöbə", "text"),
+    "I_QRUP_AD": ("İstəyən şöbənin bölməsi", "text"),
+    "V_QRUP_AD": ("Verən deponun bölməsi", "text"),
+    "PAKET": ("Paket", "text"),
+    "I_SATIS": ("Dərman satışı — 'İstəyən şöbə' qaydası (AZN)", "money"),
+    "V_SATIS": ("Dərman satışı — 'Verən depo' qaydası (AZN)", "money"),
+    "FERQ_SATIS": ("Fərq: verən − istəyən (AZN)", "money"),
+    "I_MAYA": ("Maya dəyəri — 'İstəyən şöbə' (AZN)", "money"),
+    "V_MAYA": ("Maya dəyəri — 'Verən depo' (AZN)", "money"),
+    "AIDIYYET_IZAH": ("Fərq haradan yaranır", "text"),
+    "KURUM": ("Təşkilat", "text"),
+    "TESKILAT_XIDMET": ("Xidmət — təşkilatın payı (AZN)", "money"),
+    "PASIYENT_XIDMET": ("Xidmət — pasiyentin ödədiyi (AZN)", "money"),
+    "DERMAN_TESKILAT": ("Dərman — təşkilatın payı (AZN)", "money"),
+    "TESKILAT_CEMI": ("Təşkilata cəmi satış (AZN)", "money"),
+    "ORG_PAY": ("Filialda təşkilatlar arasında payı", "pct"),
+    "DERMAN_MAYA": ("Satılan dərmanın maya dəyəri (AZN)", "money"),
+    "DERMAN_MARJA": ("Dərman marjası (AZN)", "money"),
+    "MARJA_PAY": ("Dərman marjası, %", "pct"),
+    "PAKET_MAYA": ("Paketə daxil dərman — maya (AZN)", "money"),
+    "SERFIYYAT": ("Şöbə daxili sərfiyyat (AZN)", "money"),
+    "DERMAN_XERC": ("Cəmi dərman xərci (AZN)", "money"),
+    "QEBUL_BASI_DERMAN": ("Qəbul başına dərman xərci (AZN)", "money"),
+    "CEMI_GELIR": ("Cəmi satış: xidmət + dərman (AZN)", "money"),
+    "DERMAN_PAY": ("Dərmanın cəmi satışda payı", "pct"),
+    "TECHIZAT": ("Şöbəyə verilən təchizat (AZN)", "money"),
+    "KORP_MENTEQE": ("Korporativ məntəqələrə çıxış (AZN)", "money"),
+    "DERMAN_AD": ("Dərman", "text"),
+    "BIRIM": ("Ölçü vahidi", "text"),
+    "MIQDAR": ("Miqdar", "dec1"),
+    "DERMAN_RANK": ("Yer", "int"),
+    "QRUP_PAY": ("Bölmə xərcində payı", "pct"),
+    "DEPOADI": ("Verən depo", "text"),
+    "OBYEKT": ("Şöbə / depo (hesabatda)", "text"),
+    "NOV": ("Növü", "text"),
+    "TIP": ("Çıxış növü", "text"),
+    "SATIR": ("Sətir sayı", "int"),
+    "XERCE_DAXIL": ("Dərman xərcinə daxildir", "text"),
+    "ISTEYEN": ("İstəyən şöbə", "text"),
+    "D_SATIS": ("Satış məbləği (AZN)", "money"),
+    "CIKIS_YERI": ("Çıxış istiqaməti", "text"),
+    "SINIF": ("Təsnifat", "text"),
+    "MAYA": ("Maya dəyəri (AZN)", "money"),
+    "YOXLAMA": ("Yoxlama", "text"),
+    "GOZLENILEN": ("Gözlənilən", "auto"),
+    "FAKTIKI": ("Faktiki", "auto"),
+    "FERQ": ("Fərq", "auto"),
+    "NETICE": ("Nəticə", "text"),
+    "SERH": ("Şərh", "text"),
+}
+
+# Excel-də canlı düsturlar (rəqəmlər yoxlanıla bilsin): {X} = eyni sətir, {COL:X} = bütün sütun aralığı
+FORMULAS = {
+    "YENI_PAY": "=IFERROR({YENI_QEBUL}/{CEMI_QEBUL},0)",
+    "NAGD_PAY": "=IFERROR({NAGD}/{SATIS},0)",
+    "SIG_PAY": "=IFERROR({SIGORTA}/{SATIS},0)",
+    "ITS_PAY": "=IFERROR({ITS}/{SATIS},0)",
+    "DERMAN_NAGD_PAY": "=IFERROR({DERMAN_NAGD}/{DERMAN_GELIR},0)",
+    "DERMAN_SIG_PAY": "=IFERROR({DERMAN_SIG}/{DERMAN_GELIR},0)",
+    "DERMAN_ITS_PAY": "=IFERROR({DERMAN_ITS}/{DERMAN_GELIR},0)",
+    "DERMAN_KORP_PAY": "=IFERROR({DERMAN_KORP}/{DERMAN_GELIR},0)",
+    "TESKILAT_CEMI": "={TESKILAT_XIDMET}+{DERMAN_TESKILAT}",
+    "HEKIM_QAZANC": "={HK_YAPAN}+{HK_GONDEREN}",
+    "HEKIM_PAY": "=IFERROR(({HK_YAPAN}+{HK_GONDEREN})/{CEMI_GELIR},0)",
+    "DOVRIYYE": "={CEMI_GELIR}-{DERMAN_XERC}-{HEKIM_QAZANC}",
+    "DOVRIYYE_MARJA": "=IFERROR({DOVRIYYE}/{CEMI_GELIR},0)",
+    "DOVRIYYE_QEBUL": "=IFERROR({DOVRIYYE}/{CEMI_QEBUL},0)",
+    "KORP_PAY": "=IFERROR({KORPORATIV}/{SATIS},0)",
+    "ORTA_CEK": "=IFERROR({SATIS}/{CEMI_QEBUL},0)",
+    "HEKIM_BASI_QEBUL": "=IFERROR({CEMI_QEBUL}/{HEKIM_SAYI},0)",
+    "HEKIM_BASI_SATIS": "=IFERROR({SATIS}/{HEKIM_SAYI},0)",
+    "GUNLUK_SATIS": "=IFERROR({SATIS}/{GUN},0)",
+    "GUNLUK_QEBUL": "=IFERROR({CEMI_QEBUL}/{GUN},0)",
+    "DERMAN_MARJA": "={DERMAN_GELIR}-{DERMAN_MAYA}",
+    "MARJA_PAY": "=IFERROR(({DERMAN_GELIR}-{DERMAN_MAYA})/{DERMAN_GELIR},0)",
+    "DERMAN_XERC": "={DERMAN_MAYA}+{PAKET_MAYA}+{SERFIYYAT}",
+    "CEMI_GELIR": "={SATIS}+{DERMAN_GELIR}",
+    "DERMAN_PAY": "=IFERROR({DERMAN_GELIR}/({SATIS}+{DERMAN_GELIR}),0)",
+    "QEBUL_BASI_DERMAN": "=IFERROR(({DERMAN_MAYA}+{PAKET_MAYA}+{SERFIYYAT})/{CEMI_QEBUL},0)",
+}
+
+thin = Side(style="thin", color=C_GRID)
+BORDER = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+
+def fill(c):
+    return PatternFill("solid", start_color=c, end_color=c)
+
+
+def font(size=10, bold=False, color="1F2937", italic=False):
+    return Font(name=FONT, size=size, bold=bold, color=color, italic=italic)
+
+
+def band(ws, rng, text, size=11, bg=C_NAVY2, fg="FFFFFF", height=22, align="left"):
+    ws.merge_cells(rng)
+    c = ws[rng.split(":")[0]]
+    c.value = text
+    c.fill, c.font = fill(bg), font(size, True, fg)
+    c.alignment = Alignment(horizontal=align, vertical="center", indent=1, wrap_text=True)
+    ws.row_dimensions[c.row].height = height
+    return c
+
+
+def _pyval(v):
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return None
+    if isinstance(v, (np.integer,)):
+        return int(v)
+    if isinstance(v, (np.floating,)):
+        return float(v)
+    if isinstance(v, pd.Timestamp):
+        return v.to_pydatetime()
+    try:
+        if pd.isna(v):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return v
+
+
+AID_NAME = "DERMAN_AIDIYYET"
+AID_CELL_ABS = "$D$8"
+AID_OPTIONS = ("İstəyən şöbə", "Verən depo")
+AID_SUBTITLE = "  ·  Dərman aidiyyəti: Panel → D8 seçiminə görə"
+
+
+def drug_formulas(sheet, info):
+    """Dərman sütunları üçün Excel düsturları: seçilmiş aidiyyət qaydasına görə 'Dərman — Məlumat' vərəqindən toplanır."""
+    L, r0, r1 = info["letters"], info["r0"], info["r1"]
+    D = lambda k: f"'{sheet}'!${L[k]}${r0}:${L[k]}${r1}"
+    KEN, DAX = f',{D("PAKET")},"Paketdən kənar"', f',{D("PAKET")},"Paketə daxil"'
+
+    def pick(val, by_i, by_v, extra):
+        return (f'IF({AID_NAME}="{AID_OPTIONS[1]}",SUMIFS({D(val)},{D("FILIAL")},{{FILIAL}},{by_v}{extra}),'
+                f'SUMIFS({D(val)},{D("FILIAL")},{{FILIAL}},{by_i}{extra}))')
+
+    def family(by_i, by_v):
+        f = {"DERMAN_GELIR": "=" + pick("D_SATIS", by_i, by_v, KEN),
+             "DERMAN_MAYA": "=" + pick("MAYA", by_i, by_v, KEN),
+             "PAKET_MAYA": "=" + pick("MAYA", by_i, by_v, DAX)}
+        for k, lab in [("DERMAN_NAGD", "NAGD"), ("DERMAN_SIG", "SIG"), ("DERMAN_ITS", "ITS"), ("DERMAN_KORP", "KORP")]:
+            f[k] = "=" + pick("D_SATIS", by_i, by_v, KEN + f',{D("ODENIS_NOVU")},"{PAY_LABEL[lab]}"')
+        return f
+
+    crit = '{QRUP_AD}'
+    grp_crit = f'IF({crit}="{TOTAL_LABEL}","?*",{crit})'
+    grp = family(f'{D("I_QRUP_AD")},{grp_crit}', f'{D("V_QRUP_AD")},{grp_crit}')
+    sobe = family(f'{D("ISTEYEN")},{{SR_ADI}}', f'{D("DEPOADI")},{{SR_ADI}}')
+    by_name = family(f'{D("ISTEYEN")},{{OBYEKT}}', f'{D("DEPOADI")},{{OBYEKT}}')
+    by_grp = family(f'{D("I_QRUP_AD")},{{QRUP_AD}}', f'{D("V_QRUP_AD")},{{QRUP_AD}}')
+    comp = {k: f'=IF({{NOV}}="{GROUP_SUBTOTAL}",{by_grp[k][1:]},{by_name[k][1:]})'
+            for k in ("DERMAN_GELIR", "DERMAN_MAYA", "PAKET_MAYA")}
+    return {"grp": grp, "sobe": sobe, "comp": comp}
+
+
+SHEET_KEYS, FORMULA_KEYS = {}, set()   # sütun -> vərəqlər (Metodologiyadakı sütun izahı üçün)
+
+# Hər sütunun necə formalaşdığı — Metodologiya vərəqində avtomatik cədvələ çevrilir
+COL_DOC = {
+    "FILIAL": "Filial (Babək, Mərkəz, Medilux).",
+    "QRUP_AD": "Bölmə — filialda fərqli adlanan şöbələrin birləşdirildiyi vahid qrup (tərkibi bu vərəqin 3-cü bölməsində və 'Dərman — Bölmə Tərkibi' vərəqində). 'Filial cəmi' sətri filialın seçilmiş bölmələrinin cəmidir.",
+    "SR_ADI": "Sistemdəki şöbə adı.",
+    "OBYEKT": "Bölməyə daxil edilən şöbə və ya onun dərman/təsərrüfat deposu.",
+    "NOV": "Şöbə — klinik şöbə; Depo — şöbənin dərman/təsərrüfat deposu; Bölmə cəmi — bölmənin yekunu.",
+    "AMB_QEBUL": "Ambulator pasiyent müraciətlərinin sayı (hər müraciət bir dəfə).",
+    "STAS_QEBUL": "Stasionar pasiyent müraciətlərinin sayı (hər müraciət bir dəfə).",
+    "CEMI_QEBUL": "Pasiyent müraciətlərinin sayı. Bir müraciətdə neçə xidmət olmasından asılı olmayaraq bir dəfə sayılır; bölmə və filial səviyyəsində ayrıca hesablanır.",
+    "UNIKAL_PASIYENT": "Dövrdə müraciət etmiş fərqli şəxslərin sayı.",
+    "YENI_QEBUL": "Pasiyentin həmin filiala ilk müraciəti olan qəbullar.",
+    "TEKRAR_QEBUL": "Pasiyentin əvvəllər də müraciəti olduğu qəbullar. Yeni + Təkrar = Cəmi qəbul.",
+    "YENI_PAY": "Yeni pasiyent ÷ Cəmi qəbul.",
+    "HEKIM_SAYI": "Dövrdə ən azı bir xidmət göstərmiş fərqli həkimlərin sayı.",
+    "XIDMET_SATIRI": "Göstərilmiş xidmətlərin sayı (sətir üzrə).",
+    "SATIS": "Xidmət satışı = pasiyentin ödədiyi hissə + təşkilatın (sığorta/korporativ) ödədiyi hissə. Dərman daxil deyil.",
+    "NAGD": "Xidmət satışında pasiyentin özünün ödədiyi hissə (franşiza daxil).",
+    "SIGORTA": "Xidmət satışında könüllü tibbi sığorta şirkətlərinin hissəsi.",
+    "ITS": "Xidmət satışında İcbari tibbi sığortanın hissəsi (xəstə növü və ya təşkilat İcbari olduqda).",
+    "KORPORATIV": "Xidmət satışında korporativ və digər müqaviləli təşkilatların hissəsi.",
+    "NAGD_PAY": "Nağd ÷ Xidmət satışı.", "SIG_PAY": "Sığorta ÷ Xidmət satışı.", "ITS_PAY": "İTS ÷ Xidmət satışı.",
+    "KORP_PAY": "Korporativ ÷ Xidmət satışı.",
+    "ORTA_CEK": "Xidmət satışı ÷ Cəmi qəbul.",
+    "FILIAL_PAY": "Sətrin xidmət satışı ÷ filialın cəmi xidmət satışı.",
+    "HOSP_SAYI": "Dövrdə stasionara yerləşdirilmiş pasiyentlərin sayı (şöbələrarası keçid bir hospitalizasiyadır).",
+    "HELE_YATAN": "Dövrün sonunda müalicəsi davam edən pasiyentlər.",
+    "TAXIS_SAYI": "Dövrdə evə yazılmış pasiyentlər.",
+    "ORTA_YATIS": "Evə yazılanlar üzrə orta yatış günü (çıxış − giriş; eyni gün = 1 gün).",
+    "HEKIM_BASI_QEBUL": "Cəmi qəbul ÷ Aktiv həkim sayı.",
+    "HEKIM_BASI_SATIS": "Xidmət satışı ÷ Aktiv həkim sayı.",
+    "DERMAN_GELIR": "Pasiyentə yazılan, paketə daxil olmayan dərmanların satış məbləği. Dərmanı istəyən şöbəyə yazılır.",
+    "DERMAN_NAGD": "Dərman satışında pasiyentin ödədiyi hissə.", "DERMAN_SIG": "Dərman satışında sığorta hissəsi.",
+    "DERMAN_ITS": "Dərman satışında İcbari tibbi sığorta hissəsi.", "DERMAN_KORP": "Dərman satışında korporativ hissə.",
+    "DERMAN_NAGD_PAY": "Dərman — nağd ÷ Dərman satışı.", "DERMAN_SIG_PAY": "Dərman — sığorta ÷ Dərman satışı.",
+    "DERMAN_ITS_PAY": "Dərman — İTS ÷ Dərman satışı.", "DERMAN_KORP_PAY": "Dərman — korporativ ÷ Dərman satışı.",
+    "DERMAN_MAYA": "Satılan (paketdən kənar) dərmanların alış qiyməti ilə dəyəri.",
+    "DERMAN_MARJA": "Dərman satışı − Satılan dərmanın maya dəyəri.",
+    "MARJA_PAY": "Dərman marjası ÷ Dərman satışı.",
+    "PAKET_MAYA": "Paket qiymətinə daxil olan, ayrıca satılmayan dərmanların maya dəyəri.",
+    "SERFIYYAT": "Şöbə deposundan istifadə edilib tullantı/silinmə anbarına çıxılan dərman və sərf materialı (maya dəyəri ilə).",
+    "DERMAN_XERC": "Cəmi dərman xərci = Satılan dərmanın maya dəyəri + Paketə daxil dərman + Şöbə daxili sərfiyyat.",
+    "QEBUL_BASI_DERMAN": "Cəmi dərman xərci ÷ Cəmi qəbul.",
+    "CEMI_GELIR": "Cəmi satış = Xidmət satışı + Dərman satışı.",
+    "DERMAN_PAY": "Dərman satışı ÷ Cəmi satış.",
+    "TECHIZAT": "Aptek və anbardan şöbə depolarına verilən dərman (məlumat üçün; xərcə ikinci dəfə toplanmır).",
+    "KORP_MENTEQE": "Şöbə deposundan korporativ məntəqələrə çıxılan dərman (bölmənin xərcinə daxil deyil).",
+    "HK_YAPAN": "Xidməti icra edən həkimə hesablanmış hakediş.",
+    "HK_GONDEREN": "Pasiyenti göndərən həkimə hesablanmış hakediş.",
+    "HEKIM_QAZANC": "Həkim qazancı = icra + göndərən hakedişi. Xidmətin icra edildiyi şöbəyə yazılır.",
+    "HEKIM_PAY": "Həkim qazancı ÷ Cəmi satış.",
+    "DOVRIYYE": "Xalis dövriyyə = Cəmi satış − Cəmi dərman xərci − Həkim qazancı. Digər xərclər daxil deyil (mənfəət deyil).",
+    "DOVRIYYE_MARJA": "Xalis dövriyyə ÷ Cəmi satış.",
+    "DOVRIYYE_QEBUL": "Xalis dövriyyə ÷ Cəmi qəbul.",
+    "PERSADI": "Həkimin adı. '— Həkim qeyd olunmayıb —' — sistemdə həkimi göstərilməyən xidmətlər.",
+    "SOBE_PAY": "Həkimin xidmət satışı ÷ həmin şöbənin cəmi xidmət satışı.",
+    "SOBE_RANK": "Həkimin şöbədə xidmət satışına görə yeri.",
+    "AY_AD": "Təqvim ayı.", "GUN": "Ayın hesabat dövrünə düşən gün sayı (natamam aylar üçün).",
+    "GUNLUK_SATIS": "Xidmət satışı ÷ Dövrə düşən gün.", "GUNLUK_QEBUL": "Cəmi qəbul ÷ Dövrə düşən gün.",
+    "GONDEREN_SOBE": "Xidməti təyin edən (göndərən) şöbə.", "ICRACI_SOBE": "Xidməti icra edən şöbə.",
+    "QEBUL_EDEN_SOBE": "Yönləndirilən xidməti icra edən hesabat şöbəsi.",
+    "ITU_ADI": "Xidmətin üst qrupu (Laboratoriya, Radiologiya və s.).", "IT_ADI": "Xidmətin növü.",
+    "DERMAN_AD": "Dərmanın adı.", "BIRIM": "Ölçü vahidi.", "MIQDAR": "Dövrdə çıxılan miqdar.",
+    "DERMAN_RANK": "Bölmə daxilində cəmi dərman xərcinə görə yer.",
+    "QRUP_PAY": "Sətrin cəmi dərman xərci ÷ bölmənin cəmi dərman xərci.",
+    "D_SATIS": "Paketdən kənar dərmanın satış məbləği (paketə daxil olanlar üçün 0).",
+    "MAYA": "Dərmanın alış qiyməti ilə dəyəri.",
+    "SATIR": "Sistemdəki çıxış sətirlərinin sayı.",
+    "ODENIS_NOVU": "Təşkilatın növü: Sığorta, İcbari tibbi sığorta və ya Korporativ / digər.",
+    "KURUM": "Sığorta şirkəti və ya müqaviləli təşkilatın adı.",
+    "TESKILAT_XIDMET": "Xidmət satışında təşkilatın ödədiyi hissə.",
+    "PASIYENT_XIDMET": "Həmin təşkilatın pasiyentlərinin xidmət üçün özlərinin ödədiyi hissə (franşiza).",
+    "DERMAN_TESKILAT": "Təşkilat hesabına yazılan dərman satışı.",
+    "TESKILAT_CEMI": "Xidmət — təşkilatın payı + Dərman — təşkilatın payı.",
+    "ORG_PAY": "Təşkilatın cəmi satışı ÷ filialda bütün təşkilatların cəmi.",
+    "ISTEYEN": "Dərmanı pasiyent üçün istəyən (təyin edən) şöbə.",
+    "I_QRUP_AD": "İstəyən şöbənin aid olduğu bölmə. Boşdursa, şöbə hesabata daxil deyil.",
+    "DEPOADI": "Dərmanın fiziki olaraq çıxdığı depo.",
+    "V_QRUP_AD": "Verən deponun aid olduğu bölmə. Boşdursa, depo hesabata daxil deyil (məs. Poliklinika, Əməliyyatxana).",
+    "PAKET": "Paketdən kənar — pasiyentə ayrıca satılıb; Paketə daxil — paket qiymətinə daxildir, ayrıca satılmır.",
+    "I_SATIS": "Dərman pasiyenti istəyən şöbənin bölməsinə yazıldıqda bölmənin dərman satışı (paketdən kənar).",
+    "V_SATIS": "Dərman verən deponun bölməsinə yazıldıqda bölmənin dərman satışı (paketdən kənar).",
+    "FERQ_SATIS": "'Verən depo' qaydası − 'İstəyən şöbə' qaydası.",
+    "I_MAYA": "'İstəyən şöbə' qaydası ilə pasiyentə verilən dərmanın maya dəyəri (paketə daxil olanlar da).",
+    "V_MAYA": "'Verən depo' qaydası ilə pasiyentə verilən dərmanın maya dəyəri (paketə daxil olanlar da).",
+    "AIDIYYET_IZAH": "İki qayda arasındakı fərqi yaradan ən böyük şöbə ↔ depo axınları.",
+}
+
+
+def write_table(ws, df, keys, title, subtitle, extra_formulas=None, databars=(), scales=(), tab=None,
+                total_key="QRUP_AD", freeze_after=None):
+    formulas = dict(FORMULAS, **(extra_formulas or {}))
+    keys = [k for k in keys if k in df.columns or k in formulas]
+    for k in keys:
+        SHEET_KEYS.setdefault(k, [])
+        if ws.title not in SHEET_KEYS[k]:
+            SHEET_KEYS[k].append(ws.title)
+        if k in formulas:
+            FORMULA_KEYS.add(k)
+    n = len(keys)
+    last_col = get_column_letter(n)
+    band(ws, f"A1:{last_col}1", title, size=14, bg=C_NAVY, height=30)
+    ws.merge_cells(f"A2:{last_col}2")
+    ws["A2"].value = subtitle
+    ws["A2"].font = font(9, italic=True, color=C_MUTED)
+    ws["A2"].alignment = Alignment(indent=1)
+    hr, r0 = 4, 5
+    letters = {k: get_column_letter(i + 1) for i, k in enumerate(keys)}
+    r1 = r0 + max(len(df), 1) - 1
+
+    for i, k in enumerate(keys, 1):
+        c = ws.cell(row=hr, column=i, value=COLS[k][0])
+        c.fill, c.font, c.border = fill(C_NAVY2), font(9, True, "FFFFFF"), BORDER
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ws.row_dimensions[hr].height = 44
+
+    if df.empty:
+        ws.cell(row=r0, column=1, value="Bu dövr üçün məlumat yoxdur").font = font(10, italic=True, color=C_MUTED)
+        return {"letters": letters, "r0": r0, "r1": r0}
+
+    recs = df.to_dict("records")
+    for j, rec in enumerate(recs):
+        r = r0 + j
+        is_total = rec.get(total_key) in (TOTAL_LABEL, GROUP_SUBTOTAL)
+        rowfill = fill(C_TOTAL) if is_total else (fill(C_ZEBRA) if j % 2 else None)
+        for i, k in enumerate(keys, 1):
+            kind = COLS[k][1]
+            if k in formulas and all(t in letters for t in re.findall(r"\{(?:COL:)?([A-Z_]+)\}", formulas[k])):
+                f = formulas[k]
+                f = re.sub(r"\{COL:([A-Z_]+)\}", lambda mm: f"${letters[mm.group(1)]}${r0}:${letters[mm.group(1)]}${r1}", f)
+                f = re.sub(r"\{([A-Z_]+)\}", lambda mm: f"{letters[mm.group(1)]}{r}", f)
+                val = f
+            else:
+                val = _pyval(rec.get(k))
+            c = ws.cell(row=r, column=i, value=val)
+            c.border = BORDER
+            c.font = font(9, bold=is_total)
+            if rowfill:
+                c.fill = rowfill
+            if kind == "auto":
+                c.number_format = FMT["money"] if isinstance(val, float) else ("#,##0" if isinstance(val, int) else "@")
+                c.alignment = Alignment(horizontal="right")
+            elif kind == "text":
+                c.alignment = Alignment(vertical="center", wrap_text=k in ("SERH",))
+            else:
+                c.number_format = FMT[kind]
+
+    # sütun enləri
+    for i, k in enumerate(keys, 1):
+        L = get_column_letter(i)
+        if COLS[k][1] == "text":
+            mx = max([len(str(_pyval(v) or "")) for v in df[k]] + [10]) if k in df else 12
+            ws.column_dimensions[L].width = min(max(mx + 3, 12), 60 if k == "SERH" else 38)
+        else:
+            ws.column_dimensions[L].width = 15 if COLS[k][1] in ("money", "auto") else 12.5
+
+    for k in databars:
+        if k in letters:
+            L = letters[k]
+            ws.conditional_formatting.add(f"{L}{r0}:{L}{r1}", DataBarRule(start_type="num", start_value=0,
+                                                                          end_type="max", color="7FA7E8"))
+    for k in scales:
+        if k in letters:
+            L = letters[k]
+            ws.conditional_formatting.add(f"{L}{r0}:{L}{r1}", ColorScaleRule(
+                start_type="min", start_color="F8D7DA", mid_type="percentile", mid_value=50,
+                mid_color="FFFFFF", end_type="max", end_color="CDEFD9"))
+
+    ws.auto_filter.ref = f"A{hr}:{last_col}{r1}"
+    fa = freeze_after or next((i for i, k in enumerate(keys) if COLS[k][1] != "text"), 1)
+    ws.freeze_panes = ws.cell(row=r0, column=fa + 1)
+    ws.sheet_view.showGridLines = False
+    ws.sheet_view.zoomScale = 90
+    if tab:
+        ws.sheet_properties.tabColor = tab
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.fitToWidth, ws.page_setup.fitToHeight = 1, 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.print_title_rows = f"{hr}:{hr}"
+    ws.oddFooter.left.text = f"Hazırlayan: {PREPARED_BY}"
+    ws.oddFooter.right.text = "&P / &N"
+    return {"letters": letters, "r0": r0, "r1": r1}
+
+
+def fmt_az(x, dec=0):
+    s = f"{x:,.{dec}f}"
+    return s.replace(",", " ").replace(".", ",")
+
+
+def build_insights(m):
+    cmp, met, hek, dq = m["cmp"], m["met"], m["hekim"], m["dq"]
+    out = []
+    if cmp.empty:
+        return ["Məlumat yoxdur."]
+    tot = met[met["SEVIYYE"] == "F"]
+    T = tot["SATIS"].sum()
+    br = tot.sort_values("SATIS", ascending=False)
+    out.append(f"Xidmət satışı {fmt_az(T)} AZN. Ən böyük pay — {br.iloc[0]['FILIAL']} filialı "
+               f"({br.iloc[0]['SATIS'] / T:.0%}); " +
+               ", ".join(f"{r.FILIAL} {r.SATIS / T:.0%}" for r in br.iloc[1:].itertuples()) + ".")
+    g = cmp[cmp["SEVIYYE"] == "Q"].sort_values("SATIS", ascending=False)
+    top = g.iloc[0]
+    out.append(f"Ən yüksək satışlı bölmə: {top['FILIAL']} — {top['QRUP_AD']}: {fmt_az(top['SATIS'])} AZN "
+               f"(seçilmiş bölmələrin ümumi satışının {top['SATIS'] / T:.0%}-i).")
+    gg = g[g["CEMI_QEBUL"] >= 50]
+    if len(gg) > 1:
+        hi, lo = gg.sort_values("ORTA_CEK").iloc[-1], gg.sort_values("ORTA_CEK").iloc[0]
+        out.append(f"Orta çek: ən yüksək {hi['FILIAL']} — {hi['QRUP_AD']} ({fmt_az(hi['ORTA_CEK'], 2)} AZN), "
+                   f"ən aşağı {lo['FILIAL']} — {lo['QRUP_AD']} ({fmt_az(lo['ORTA_CEK'], 2)} AZN); "
+                   f"fərq {hi['ORTA_CEK'] / lo['ORTA_CEK']:.1f} dəfə.")
+    s = tot.sort_values("SIG_PAY", ascending=False)
+    its = ", ".join(f"{r.FILIAL} {r.ITS_PAY:.0%}" for r in tot.itertuples() if r.ITS_PAY >= 0.005)
+    out.append("Xidmət satışında sığorta payı: " + ", ".join(f"{r.FILIAL} {r.SIG_PAY:.0%}" for r in s.itertuples()) +
+               (f"; İcbari tibbi sığorta: {its}" if its else "") +
+               f"; nağd (pasiyent) payı ən yüksək — {tot.sort_values('NAGD_PAY').iloc[-1]['FILIAL']}.")
+    y = tot.sort_values("YENI_PAY", ascending=False)
+    out.append("Yeni pasiyent payı: " +
+               ", ".join(f"{r.FILIAL} {r.YENI_PAY:.0%}" for r in y.itertuples()) + ".")
+    if m.get("has_hak") and "DOVRIYYE" in tot:
+        CG, DV, HQ = tot["CEMI_GELIR"].sum(), tot["DOVRIYYE"].sum(), tot["HEKIM_QAZANC"].sum()
+        out.append(f"Xalis dövriyyə {fmt_az(DV)} AZN — marja {DV / CG:.0%}; həkim qazancı satışın {HQ / CG:.0%}-i "
+                   f"({fmt_az(HQ)} AZN). Filiallar üzrə marja: " +
+                   ", ".join(f"{r.FILIAL} {r.DOVRIYYE_MARJA:.0%}" for r in tot.sort_values("DOVRIYYE_MARJA", ascending=False).itertuples()) + ".")
+        gm = g[(g["CEMI_QEBUL"] >= 50) & (g["CEMI_GELIR"] > 0)].sort_values("DOVRIYYE_MARJA")
+        if len(gm) > 1:
+            lo, hi = gm.iloc[0], gm.iloc[-1]
+            out.append(f"Ən rentabelli bölmə: {hi['FILIAL']} — {hi['QRUP_AD']} (marja {hi['DOVRIYYE_MARJA']:.0%}); "
+                       f"ən aşağı: {lo['FILIAL']} — {lo['QRUP_AD']} ({lo['DOVRIYYE_MARJA']:.0%}).")
+    if "DERMAN_GELIR" in tot and tot["DERMAN_GELIR"].sum() > 0:
+        out.append("Qeyd: bu mətnlər standart 'İstəyən şöbə' qaydası ilə yazılıb; yuxarıdakı kartlar, cədvəllər və "
+                   "qrafiklər D8-dəki seçimə görə dəyişir.")
+    org = m.get("org", pd.DataFrame())
+    if not org.empty:
+        o = org.sort_values("TESKILAT_CEMI", ascending=False).iloc[0]
+        out.append(f"Ən böyük təşkilat: {o['KURUM']} ({o['FILIAL']}, {o['ODENIS_NOVU']}) — {fmt_az(o['TESKILAT_CEMI'])} AZN "
+                   f"(xidmət + dərman); cəmi {org['KURUM'].nunique()} təşkilat üzrə satış olub.")
+    hb = g[g["HEKIM_SAYI"] >= 2].sort_values("HEKIM_BASI_SATIS", ascending=False)
+    if not hb.empty:
+        h = hb.iloc[0]
+        out.append(f"Həkim məhsuldarlığı: ən yüksək həkim başına satış — {h['FILIAL']} {h['QRUP_AD']} "
+                   f"({fmt_az(h['HEKIM_BASI_SATIS'])} AZN/həkim, {fmt_az(h['HEKIM_BASI_QEBUL'], 1)} qəbul/həkim).")
+    if not hek.empty:
+        d = hek[hek["PERSKODU"] != "—"].sort_values("SATIS", ascending=False).iloc[0]
+        out.append(f"Ən yüksək satışlı həkim: {d['PERSADI']} ({d['FILIAL']}, {d['SR_ADI']}) — "
+                   f"{fmt_az(d['SATIS'])} AZN, {fmt_az(d['CEMI_QEBUL'])} qəbul.")
+    if "DERMAN_GELIR" in tot and tot["DERMAN_GELIR"].sum() > 0:
+        DG, DM = tot["DERMAN_GELIR"].sum(), tot["DERMAN_MAYA"].sum()
+        CG = tot["CEMI_GELIR"].sum()
+        mb = tot[tot["DERMAN_GELIR"] > 0].sort_values("MARJA_PAY")
+        out.append(f"Dərman satışı {fmt_az(DG)} AZN — cəmi satışın {DG / CG:.0%}-i; orta marja "
+                   f"{(DG - DM) / DG:.0%} (" + ", ".join(f"{r.FILIAL} {r.MARJA_PAY:.0%}" for r in mb.iloc[::-1].itertuples()) + ").")
+        gq = g[(g["CEMI_QEBUL"] >= 50) & (g["DERMAN_XERC"] > 0)].sort_values("QEBUL_BASI_DERMAN", ascending=False)
+        if not gq.empty:
+            h = gq.iloc[0]
+            out.append(f"Qəbul başına ən yüksək dərman xərci: {h['FILIAL']} — {h['QRUP_AD']} "
+                       f"({fmt_az(h['QEBUL_BASI_DERMAN'], 2)} AZN/qəbul).")
+        PK, SF = tot["PAKET_MAYA"].sum(), tot["SERFIYYAT"].sum()
+        out.append(f"Ayrıca satışı olmayan dərman xərci: paketə daxil {fmt_az(PK)} AZN, şöbə daxili sərfiyyat {fmt_az(SF)} AZN "
+                   f"— cəmi dərman xərcinin {(PK + SF) / tot['DERMAN_XERC'].sum():.0%}-i.")
+        KM = tot["KORP_MENTEQE"].sum()
+        if KM > 0:
+            out.append(f"Korporativ məntəqələrə {fmt_az(KM)} AZN dərman çıxılıb — TTY xərcinə daxil edilməyib, "
+                       f"ayrıca göstərilir.")
+    return out
+
+
+def style_chart(ch, title, ytitle=None, fmt="#,##0"):
+    ch.title = title
+    ch.roundedCorners = False
+    ch.width, ch.height = 16.8, 8.6
+    ch.legend.position = "b"
+    ch.legend.overlay = False
+    try:
+        ch.title.overlay = False
+    except AttributeError:
+        pass
+    ch.x_axis.delete = False
+    ch.y_axis.delete = False
+    ch.y_axis.numFmt = fmt
+    ch.y_axis.majorGridlines.spPr = None
+    if ytitle:
+        ch.y_axis.title = ytitle
+    return ch
+
+
+def color_series(ch, colors):
+    for s, c in zip(ch.series, colors):
+        s.graphicalProperties.solidFill = c
+        s.graphicalProperties.line.solidFill = c
+
+
+def month_trends(m):
+    """Son iki ay üzrə gündəlik orta dəyişmə (natamam aylar gündəlik ortalama ilə müqayisə olunur)."""
+    ay = m["ay"]
+    if ay.empty:
+        return {}
+    a = ay[ay["QRUP"] == "ALL"].groupby("AY").agg(SATIS=("SATIS", "sum"), QEBUL=("CEMI_QEBUL", "sum"),
+                                                  GUN=("GUN", "max")).sort_index()
+    a = a[a["GUN"] > 0]
+    if len(a) < 2:
+        return {}
+    cur, prev = a.iloc[-1], a.iloc[-2]
+    lbl = f"{AZ_MONTHS[a.index[-1].month - 1][:3]}/{AZ_MONTHS[a.index[-2].month - 1][:3]}"
+
+    def ch(c, p):
+        return (c / p - 1) if p else None
+    return {
+        "SATIS": (ch(cur.SATIS / cur.GUN, prev.SATIS / prev.GUN), f"{lbl}, gündəlik orta"),
+        "QEBUL": (ch(cur.QEBUL / cur.GUN, prev.QEBUL / prev.GUN), f"{lbl}, gündəlik orta"),
+        "CEK": (ch(cur.SATIS / cur.QEBUL, prev.SATIS / prev.QEBUL), lbl),
+    }
+
+
+def build_dashboard(wb, ws, m, cmp_info, start, end_incl, status, S):
+    CMP = f"'{S['cmp']}'"
+    L, r0, r1 = cmp_info["letters"], cmp_info["r0"], cmp_info["r1"]
+    R = lambda k: f"{CMP}!${L[k]}${r0}:${L[k]}${r1}"
+    CANVAS, CARD, TXT, MUTED, GOLD = "0B1220", "16223A", "E6EDF7", "8FA3BF", "F5B700"
+    ws.sheet_view.showGridLines = False
+    ws.sheet_view.zoomScale = 90
+    ws.sheet_properties.tabColor = GOLD
+    ws.column_dimensions["A"].width = 3
+    for i in range(2, 16):
+        ws.column_dimensions[get_column_letter(i)].width = 13.5
+    ws.column_dimensions["P"].width = 3
+    LAST_COL = 16
+
+    # tünd kətan: əvvəlcə bütün sahəni rəngləyirik, sonra üzərinə kartlar gəlir
+    END_ROW = 140
+    for rr in range(1, END_ROW + 1):
+        ws.row_dimensions[rr].height = 15
+        for cc in range(1, LAST_COL + 1):
+            ws.cell(row=rr, column=cc).fill = fill(CANVAS)
+
+    def text(cell, value, size=10, bold=False, color=TXT, h="left", italic=False, indent=0):
+        c = ws[cell] if isinstance(cell, str) else cell
+        c.value = value
+        c.font = font(size, bold, color, italic)
+        c.alignment = Alignment(horizontal=h, vertical="center", indent=indent, wrap_text=True)
+        return c
+
+    # --- Başlıq ---
+    ws.row_dimensions[1].height = 10
+    ws.merge_cells("B2:O2")
+    text("B2", "FƏALİYYƏT VƏ SATIŞ HESABATI", 22, True, "FFFFFF")
+    ws.row_dimensions[2].height = 36
+    ws.merge_cells("B3:O3")
+    text("B3", "  ·  ".join(GROUP_LABEL[g] for g in GROUP_ORDER), 12, True, GOLD)
+    ws.row_dimensions[3].height = 22
+    days = (end_incl - start).days + 1
+    ok = [s["FILIAL"] for s in status if s["OK"]]
+    ws.merge_cells("B4:O4")
+    text("B4", f"Dövr: {start:%d.%m.%Y} – {end_incl:%d.%m.%Y} ({days} gün)    ·    Filiallar: {', '.join(ok)}    ·    "
+               f"Mənbə: FONET    ·    Hazırlanıb: {datetime.now():%d.%m.%Y %H:%M}    ·    Hazırlayan: {PREPARED_BY}",
+         9, color=MUTED)
+    ws.row_dimensions[5].height = 4
+    for cc in range(2, 16):
+        ws.cell(row=5, column=cc).fill = fill(GOLD)
+
+    nav = [("Filial müqayisəsi", S["cmp"]), ("Rentabellik", S["rent"]), ("Şöbələr", S["dept"]),
+           ("Dərman sərfi", S["drug"]), ("Təşkilatlar", S["org"]), ("Həkimlər", S["hek"]),
+           ("Metodologiya", S["notes"])]
+    ws.row_dimensions[6].height = 8
+    for i, (txt, sh) in enumerate(nav):
+        col = 2 + i * 2
+        ws.merge_cells(start_row=7, start_column=col, end_row=7, end_column=col + 1)
+        c = ws.cell(row=7, column=col)
+        text(c, f"{txt}  ›", 9, True, "FFFFFF", h="center")
+        c.hyperlink = f"#'{sh}'!A1"
+        for cc in (col, col + 1):
+            ws.cell(row=7, column=cc).fill = fill(CARD)
+    ws.row_dimensions[7].height = 22
+    ws.row_dimensions[8].height = 24
+    ws.merge_cells("B8:C8")
+    text("B8", "Dərman aidiyyəti  ▸", 9, True, GOLD, h="right")
+    ws.merge_cells("D8:E8")
+    sel = ws["D8"]
+    sel.value = AID_OPTIONS[0]
+    sel.font, sel.fill = font(10, True, C_NAVY), fill("FFE8A3")
+    sel.alignment = Alignment(horizontal="center", vertical="center")
+    dv = DataValidation(type="list", formula1='"' + ",".join(AID_OPTIONS) + '"', allow_blank=False,
+                        showDropDown=False, promptTitle="Dərman aidiyyəti",
+                        prompt="İstəyən şöbə — dərman pasiyenti təyin edən şöbəyə yazılır (standart).\n"
+                               "Verən depo — dərman çıxdığı depoya yazılır.")
+    dv.showInputMessage = True
+    ws.add_data_validation(dv)
+    dv.add("D8")
+    ws.merge_cells("F8:O8")
+    text("F8", "Siyahıdan seçin: dərman satışı, dərman xərci, marja, xalis dövriyyə, cədvəllər və qrafiklər seçilmiş "
+               "qaydaya görə yenidən hesablanır. Fərqin izahı — 'Dərman — Aidiyyət' vərəqində.", 8, color=MUTED, italic=True)
+    m["_R"] = R
+
+    # --- KPI kartları: qradiyent fon, böyük ağ rəqəm, dəqiq dəyər və trend ---
+    TL = f'"{TOTAL_LABEL}"'
+    sf = lambda k: f"SUMIFS({R(k)},{R('QRUP_AD')},{TL})"
+    tr = month_trends(m)
+    tiles = [
+        ("XİDMƏT SATIŞI, AZN", f"={sf('SATIS')}", FMT["money0"], f"{len(BRANCH_ORDER)} filial · {len(GROUP_ORDER)} bölmə", None, tr.get("SATIS")),
+        ("CƏMİ QƏBUL", f"={sf('CEMI_QEBUL')}", FMT["int"], "müraciət sayı", None, tr.get("QEBUL")),
+        ("PASİYENT SAYI", f"={sf('UNIKAL_PASIYENT')}", FMT["int"], "fərqli şəxs", None, None),
+        ("ORTA ÇEK, AZN", f"=IFERROR({sf('SATIS')}/{sf('CEMI_QEBUL')},0)", '#,##0.00', "xidmət satışı ÷ qəbul", None,
+         tr.get("CEK")),
+        ("YENİ PASİYENT PAYI", f"=IFERROR({sf('YENI_QEBUL')}/{sf('CEMI_QEBUL')},0)", "0.0%",
+         f"={sf('YENI_QEBUL')}", '#,##0 "yeni pasiyent"', None),
+        ("HOSPİTALİZASİYA", f"={sf('HOSP_SAYI')}", FMT["int"],
+         f"=IFERROR(SUMPRODUCT(({R('QRUP_AD')}={TL})*{R('ORTA_YATIS')}*{R('TAXIS_SAYI')})/{sf('TAXIS_SAYI')},0)",
+         '"orta yatış: "0.0" gün"', None),
+        ("AKTİV HƏKİM", f"={sf('HEKIM_SAYI')}", FMT["int"],
+         f"=IFERROR({sf('SATIS')}/{sf('HEKIM_SAYI')},0)", '#,##0" AZN / həkim"', None),
+    ]
+    grads = [("1D4ED8", "3B82F6"), ("0F766E", "14B8A6"), ("6D28D9", "8B5CF6"), ("B45309", "F59E0B"),
+             ("047857", "10B981"), ("BE123C", "F43F5E"), ("0E7490", "06B6D4")]
+    tiles2 = [
+        ("CƏMİ SATIŞ, AZN", f"={sf('CEMI_GELIR')}", FMT["money0"], "xidmət + dərman", None, None),
+        ("DƏRMAN SATIŞI, AZN", f"={sf('DERMAN_GELIR')}", FMT["money0"],
+         f"=IFERROR({sf('DERMAN_GELIR')}/{sf('CEMI_GELIR')},0)", '0.0% "cəmi satışda"', None),
+        ("DƏRMAN MARJASI", f"=IFERROR({sf('DERMAN_MARJA')}/{sf('DERMAN_GELIR')},0)", "0.0%",
+         f"={sf('DERMAN_MARJA')}", '#,##0 " AZN marja"', None),
+        ("DƏRMAN XƏRCİ, AZN", f"={sf('DERMAN_XERC')}", FMT["money0"], "satılan + paket + sərfiyyat", None, None),
+        ("QƏBUL BAŞINA DƏRMAN", f"=IFERROR({sf('DERMAN_XERC')}/{sf('CEMI_QEBUL')},0)", '#,##0.00', "AZN xərc / qəbul",
+         None, None),
+        ("PAKETƏ DAXİL DƏRMAN", f"={sf('PAKET_MAYA')}", FMT["money0"], "AZN — ayrıca satılmır, maya dəyəri", None, None),
+        ("ŞÖBƏ SƏRFİYYATI", f"={sf('SERFIYYAT')}", FMT["money0"], "AZN — şöbə daxili istifadə", None, None),
+    ]
+    if m.get("has_hak"):
+        tiles2 = [
+            ("CƏMİ SATIŞ, AZN", f"={sf('CEMI_GELIR')}", FMT["money0"], "xidmət + dərman", None, None),
+            ("DƏRMAN SATIŞI, AZN", f"={sf('DERMAN_GELIR')}", FMT["money0"],
+             f"=IFERROR({sf('DERMAN_GELIR')}/{sf('CEMI_GELIR')},0)", '0.0% "cəmi satışda"', None),
+            ("DƏRMAN XƏRCİ, AZN", f"={sf('DERMAN_XERC')}", FMT["money0"],
+             f"=IFERROR({sf('DERMAN_XERC')}/{sf('CEMI_QEBUL')},0)", '#,##0.00" AZN / qəbul"', None),
+            ("HƏKİM QAZANCI, AZN", f"={sf('HEKIM_QAZANC')}", FMT["money0"],
+             f"=IFERROR({sf('HEKIM_QAZANC')}/{sf('CEMI_GELIR')},0)", '0.0% "satışdan"', None),
+            ("XALİS DÖVRİYYƏ, AZN", f"={sf('DOVRIYYE')}", FMT["money0"], "satış − dərman − həkim", None, None),
+            ("DÖVRİYYƏ MARJASI", f"=IFERROR({sf('DOVRIYYE')}/{sf('CEMI_GELIR')},0)", "0.0%",
+             f"=IFERROR({sf('DOVRIYYE')}/{sf('CEMI_QEBUL')},0)", '#,##0" AZN / qəbul"', None),
+            ("DƏRMAN MARJASI", f"=IFERROR({sf('DERMAN_MARJA')}/{sf('DERMAN_GELIR')},0)", "0.0%",
+             f"={sf('DERMAN_MARJA')}", '#,##0 " AZN marja"', None),
+        ]
+    grads2 = [("312E81", "4F46E5"), ("065F46", "059669"), ("7C2D12", "EA580C"), ("831843", "DB2777"),
+              ("1E3A8A", "2563EB"), ("3F6212", "65A30D"), ("155E75", "0891B2")]
+
+    def draw_tiles(T0, tiles, grads, n_rows):
+        for i, (lbl, f, nf, sub, subfmt, trend) in enumerate(tiles):
+            c1, c2 = 2 + i * 2, 3 + i * 2
+            g = GradientFill(type="linear", degree=90, stop=(grads[i][0], grads[i][1]))
+            for rr in range(T0, T0 + n_rows):
+                for cc in (c1, c2):
+                    ws.cell(row=rr, column=cc).fill = g
+            ws.merge_cells(start_row=T0, start_column=c1, end_row=T0, end_column=c2)
+            text(ws.cell(row=T0, column=c1), lbl, 8, True, "E0E7FF", h="center")
+            ws.merge_cells(start_row=T0 + 1, start_column=c1, end_row=T0 + 2, end_column=c2)
+            v = text(ws.cell(row=T0 + 1, column=c1), f, 20, True, "FFFFFF", h="center")
+            v.number_format = nf
+            ws.merge_cells(start_row=T0 + 3, start_column=c1, end_row=T0 + 3, end_column=c2)
+            s_ = text(ws.cell(row=T0 + 3, column=c1), sub, 8, color="E0E7FF", h="center", italic=True)
+            if subfmt:
+                s_.number_format = subfmt
+            if n_rows == 5:
+                ws.merge_cells(start_row=T0 + 4, start_column=c1, end_row=T0 + 4, end_column=c2)
+                t = ws.cell(row=T0 + 4, column=c1)
+                if trend and trend[0] is not None:
+                    arrow = "▲" if trend[0] >= 0 else "▼"
+                    text(t, f"{arrow} {trend[0]:+.1%}  ({trend[1]})".replace(".", ","), 8, True, "FFFFFF", h="center")
+                else:
+                    text(t, " ", 8)
+        for rr, h in zip(range(T0, T0 + n_rows), (20, 20, 20, 16, 18)):
+            ws.row_dimensions[rr].height = h
+
+    T0 = 9
+    draw_tiles(T0, tiles, grads, 5)
+    ws.row_dimensions[T0 + 5].height = 8
+    draw_tiles(T0 + 6, tiles2, grads2, 4)
+    T0 = T0 + 1   # aşağıdakı "row = T0 + 6" ikinci sıranın altına düşsün
+    ws.row_dimensions[T0 + 9].height = 8
+    row = T0 + 10
+    bad = [s for s in status if not s["OK"]]
+    if bad:
+        band(ws, f"B{row}:O{row}", "DİQQƏT: " + "; ".join(f"{s['FILIAL']} filialı üzrə məlumat alınmadı" for s in bad) +
+             " — göstəricilər bu filial(lar) olmadan hesablanıb.", size=10, bg="C0392B", height=26)
+        row += 2
+
+    # --- Matrislər: ağ kartlar tünd fonda; hər bölmədə ən yaxşı filial ★ qızılı ---
+    def matrix(top, c0, title, key, nf, kind="sum", with_share=False, best=True):
+        width = 6 if with_share else 5
+        ws.merge_cells(start_row=top, start_column=c0, end_row=top, end_column=c0 + width)
+        text(ws.cell(row=top, column=c0), title, 11, True, GOLD)
+        ws.row_dimensions[top].height = 22
+        hdr = ["Bölmə", "", *BRANCH_ORDER, "Cəmi"] + (["Pay"] if with_share else [])
+        for i, h in enumerate(hdr):
+            c = ws.cell(row=top + 1, column=c0 + i, value=h if h else None)
+            c.font, c.fill = font(9, True, "FFFFFF"), fill(C_NAVY2)
+            c.alignment = Alignment(horizontal="center", vertical="center")
+        ws.merge_cells(start_row=top + 1, start_column=c0, end_row=top + 1, end_column=c0 + 1)
+        ws.row_dimensions[top + 1].height = 20
+        labels = [GROUP_LABEL[g] for g in GROUP_ORDER] + [TOTAL_LABEL]
+        tot_row = top + 1 + len(labels)
+        for j, lab in enumerate(labels):
+            r = top + 2 + j
+            is_t = lab == TOTAL_LABEL
+            ws.row_dimensions[r].height = 19
+            ws.merge_cells(start_row=r, start_column=c0, end_row=r, end_column=c0 + 1)
+            for cc in range(c0, c0 + len(hdr)):
+                cell = ws.cell(row=r, column=cc)
+                cell.fill = fill("DCE7FA" if is_t else "FFFFFF")
+                cell.border = Border(bottom=Side(style="thin", color="E5E7EB"))
+            c = ws.cell(row=r, column=c0, value=lab)
+            c.font = font(9, True, C_NAVY)
+            c.alignment = Alignment(indent=1, vertical="center")
+            lab_ref = f"${get_column_letter(c0)}{r}"
+            for bi, b in enumerate(BRANCH_ORDER):
+                bref = f"{get_column_letter(c0 + 2 + bi)}${top + 1}"
+                if kind == "sum":
+                    f = f"=SUMIFS({R(key)},{R('QRUP_AD')},{lab_ref},{R('FILIAL')},{bref})"
+                else:
+                    n_, d_ = key
+                    f = (f"=IFERROR(SUMIFS({R(n_)},{R('QRUP_AD')},{lab_ref},{R('FILIAL')},{bref})/"
+                         f"SUMIFS({R(d_)},{R('QRUP_AD')},{lab_ref},{R('FILIAL')},{bref}),0)")
+                c = ws.cell(row=r, column=c0 + 2 + bi, value=f)
+                c.number_format, c.font = nf, font(9, is_t)
+                c.alignment = Alignment(vertical="center")
+            first, lastb = get_column_letter(c0 + 2), get_column_letter(c0 + 1 + len(BRANCH_ORDER))
+            tc = c0 + 2 + len(BRANCH_ORDER)
+            if kind == "sum":
+                f = f"=SUM({first}{r}:{lastb}{r})"
+            else:
+                n_, d_ = key
+                f = f"=IFERROR(SUMIFS({R(n_)},{R('QRUP_AD')},{lab_ref})/SUMIFS({R(d_)},{R('QRUP_AD')},{lab_ref}),0)"
+            c = ws.cell(row=r, column=tc, value=f)
+            c.number_format, c.font = nf, font(9, True, C_NAVY)
+            c.alignment = Alignment(vertical="center")
+            if with_share:
+                T = get_column_letter(tc)
+                c = ws.cell(row=r, column=tc + 1, value=f"=IFERROR({T}{r}/{T}${tot_row},0)")
+                c.number_format, c.font = FMT["pct"], font(9, is_t, C_MUTED)
+        first, lastb = get_column_letter(c0 + 2), get_column_letter(c0 + 1 + len(BRANCH_ORDER))
+        body = f"{first}{top + 2}:{lastb}{top + 1 + len(GROUP_ORDER)}"
+        if best:  # hər bölmədə liderlik edən filial — qızılı fon, qalın şrift
+            ws.conditional_formatting.add(body, FormulaRule(
+                formula=[f"AND({first}{top + 2}>0,{first}{top + 2}=MAX(${first}{top + 2}:${lastb}{top + 2}))"],
+                fill=fill("FFE8A3"), font=Font(name=FONT, bold=True, color="7A4B00"), stopIfTrue=True))
+        if kind == "sum":
+            ws.conditional_formatting.add(body, DataBarRule(start_type="num", start_value=0, end_type="max", color="9DBCF0"))
+        return tot_row
+
+    t1 = matrix(row, 2, "XİDMƏT SATIŞI, AZN  —  filial × bölmə", "SATIS", FMT["money0"], with_share=True)
+    matrix(row, 10, "QƏBUL SAYI  —  filial × bölmə", "CEMI_QEBUL", FMT["int"])
+    row = t1 + 2
+    t2 = matrix(row, 2, "ORTA ÇEK, AZN", ("SATIS", "CEMI_QEBUL"), FMT["money"], kind="ratio")
+    matrix(row, 10, "SIĞORTA PAYI", ("SIGORTA", "SATIS"), FMT["pct"], kind="ratio", best=False)
+    row = t2 + 2
+    t3 = matrix(row, 2, "DƏRMAN XƏRCİ, AZN  —  filial × bölmə", "DERMAN_XERC", FMT["money0"], with_share=True, best=False)
+    matrix(row, 10, "DƏRMAN MARJASI", ("DERMAN_MARJA", "DERMAN_GELIR"), FMT["pct"], kind="ratio")
+    row = t3 + 1
+    if m.get("has_hak"):
+        row += 1
+        t4 = matrix(row, 2, "XALİS DÖVRİYYƏ, AZN  —  filial × bölmə", "DOVRIYYE", FMT["money0"], with_share=True)
+        matrix(row, 10, "DÖVRİYYƏ MARJASI", ("DOVRIYYE", "CEMI_GELIR"), FMT["pct"], kind="ratio")
+        row = t4 + 1
+    ws.merge_cells(f"B{row}:O{row}")
+    text(f"B{row}", "Qızılı xana — həmin bölmədə ən yüksək göstəriciyə malik filial.   ·   Bir müraciət bir neçə bölməni "
+                    "əhatə edə bildiyi üçün qəbul sayında 'Filial cəmi' hər pasiyent müraciətini bir dəfə sayır.",
+         8, color=MUTED, italic=True)
+    ws.row_dimensions[row].height = 26
+    row += 2
+
+    # --- Əsas müşahidələr: tünd kart ---
+    ws.merge_cells(f"B{row}:O{row}")
+    text(f"B{row}", "ƏSAS MÜŞAHİDƏLƏR", 11, True, GOLD)
+    ws.row_dimensions[row].height = 22
+    for txt in build_insights(m):
+        row += 1
+        ws.merge_cells(f"B{row}:O{row}")
+        for cc in range(2, 16):
+            ws.cell(row=row, column=cc).fill = fill(CARD)
+        text(f"B{row}", "◆   " + txt, 10, color=TXT, indent=1)
+        ws.row_dimensions[row].height = 22
+    row += 2
+
+    ws.row_breaks.append(Break(id=row - 1))
+    ws.merge_cells(f"B{row}:O{row}")
+    text(f"B{row}", "QRAFİKLƏR", 11, True, GOLD)
+    ws.row_dimensions[row].height = 22
+    n_charts = add_charts(wb, ws, m, row + 1)
+    end = row + 2 + ((n_charts + 1) // 2) * 19
+    ws.merge_cells(f"B{end}:O{end}")
+    text(f"B{end}", f"Hazırlayan: {PREPARED_BY}   ·   Bütün rəqəmlər '{S['cmp']}' vərəqindən canlı düsturla hesablanır; "
+                    f"metodologiya — '{S['notes']}' vərəqində.", 8, color=MUTED, italic=True)
+
+    # kətandan kənarı gizlət: ekranda yalnız panel görünür
+    ws.column_dimensions.group("Q", "XFD", hidden=True)
+    for rr in range(1, end + 3):
+        if ws.row_dimensions[rr].height is None:
+            ws.row_dimensions[rr].height = 15
+    ws.sheet_format.zeroHeight = True
+
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.fitToWidth, ws.page_setup.fitToHeight = 1, 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.print_area = f"A1:P{end + 1}"
+    ws.oddFooter.left.text = f"Hazırlayan: {PREPARED_BY}"
+    ws.oddFooter.right.text = "&P / &N"
+
+
+def add_charts(wb, ws, m, top):
+    cd = wb["_qrafik"]
+    cmp, ay, hek = m["cmp"], m["ay"], m["hekim"]
+    q = cmp[cmp["SEVIYYE"] == "Q"] if not cmp.empty else cmp
+    f = cmp[cmp["SEVIYYE"] == "F"] if not cmp.empty else cmp
+    r = 1
+
+    def block(header, rows):
+        nonlocal r
+        start = r
+        cd.append(header)
+        for rw in rows:
+            cd.append([_pyval(v) for v in rw])
+        r = start + len(rows) + 2
+        cd.append([])
+        return start, start + len(rows)
+
+    charts = []
+    branches = [b for b in BRANCH_ORDER if not q.empty and b in set(q["FILIAL"])]
+    if branches:
+        piv = q.pivot_table(index="QRUP", columns="FILIAL", values="SATIS", aggfunc="sum").reindex(GROUP_ORDER).fillna(0)
+        s0, s1 = block(["Bölmə"] + branches, [[GROUP_LABEL[g]] + [piv.loc[g].get(b, 0) for b in branches] for g in GROUP_ORDER])
+        ch = style_chart(BarChart(), "Satış (AZN): bölmələr üzrə filial müqayisəsi")
+        ch.type, ch.grouping, ch.gapWidth = "col", "clustered", 60
+        ch.add_data(Reference(cd, min_col=2, max_col=1 + len(branches), min_row=s0, max_row=s1), titles_from_data=True)
+        ch.set_categories(Reference(cd, min_col=1, min_row=s0 + 1, max_row=s1))
+        color_series(ch, [BRANCH_COLORS[b] for b in branches])
+        charts.append(ch)
+
+        fb = f.set_index("FILIAL").reindex(branches)
+        RR = m.get("_R")
+        TL = f'"{TOTAL_LABEL}"'
+        tot = (lambda k, b: f'=SUMIFS({RR(k)},{RR("QRUP_AD")},{TL},{RR("FILIAL")},"{b}")') if RR else None
+        two = (lambda k1, k2, b: tot(k1, b) + "+" + tot(k2, b)[1:]) if RR else None
+        s0, s1 = block(["Filial", "Nağd", "Sığorta", "İTS", "Korporativ"],
+                       [[b, two("NAGD", "DERMAN_NAGD", b), two("SIGORTA", "DERMAN_SIG", b),
+                         two("ITS", "DERMAN_ITS", b), two("KORPORATIV", "DERMAN_KORP", b)] if RR else
+                        [b, fb.loc[b, "NAGD"] + fb.loc[b, "DERMAN_NAGD"], fb.loc[b, "SIGORTA"] + fb.loc[b, "DERMAN_SIG"],
+                         fb.loc[b, "ITS"] + fb.loc[b, "DERMAN_ITS"], fb.loc[b, "KORPORATIV"] + fb.loc[b, "DERMAN_KORP"]]
+                        for b in branches])
+        ch = style_chart(BarChart(), "Ödəniş strukturu (xidmət + dərman)", fmt="0%")
+        ch.type, ch.grouping, ch.overlap, ch.gapWidth = "bar", "percentStacked", 100, 50
+        ch.add_data(Reference(cd, min_col=2, max_col=5, min_row=s0, max_row=s1), titles_from_data=True)
+        ch.set_categories(Reference(cd, min_col=1, min_row=s0 + 1, max_row=s1))
+        color_series(ch, PAY_COLORS)
+        charts.append(ch)
+
+    if not ay.empty:
+        a = ay[ay["QRUP"] == "ALL"]
+        months = sorted(a["AY"].unique())
+        piv = a.pivot_table(index="AY", columns="FILIAL", values="GUNLUK_SATIS", aggfunc="sum").reindex(months).fillna(0)
+        lab = a.drop_duplicates("AY").set_index("AY")["AY_AD"]
+        s0, s1 = block(["Ay"] + branches, [[lab[mo]] + [piv.loc[mo].get(b, 0) for b in branches] for mo in months])
+        ch = style_chart(LineChart(), "Gündəlik orta satış (AZN/gün) — aylar üzrə")
+        ch.add_data(Reference(cd, min_col=2, max_col=1 + len(branches), min_row=s0, max_row=s1), titles_from_data=True)
+        ch.set_categories(Reference(cd, min_col=1, min_row=s0 + 1, max_row=s1))
+        for s, b in zip(ch.series, branches):
+            s.graphicalProperties.line.solidFill = BRANCH_COLORS[b]
+            s.graphicalProperties.line.width = 28000
+            s.smooth = False
+            s.marker.symbol = "circle"
+            s.marker.size = 7
+            s.marker.graphicalProperties.solidFill = BRANCH_COLORS[b]
+            s.marker.graphicalProperties.line.solidFill = BRANCH_COLORS[b]
+        charts.append(ch)
+
+    if branches:
+        piv = q.pivot_table(index="QRUP", columns="FILIAL", values="ORTA_CEK", aggfunc="sum").reindex(GROUP_ORDER).fillna(0)
+        s0, s1 = block(["Bölmə"] + branches, [[GROUP_LABEL[g]] + [piv.loc[g].get(b, 0) for b in branches] for g in GROUP_ORDER])
+        ch = style_chart(BarChart(), "Orta çek (AZN): bölmələr üzrə", fmt="#,##0")
+        ch.type, ch.grouping, ch.gapWidth = "col", "clustered", 60
+        ch.add_data(Reference(cd, min_col=2, max_col=1 + len(branches), min_row=s0, max_row=s1), titles_from_data=True)
+        ch.set_categories(Reference(cd, min_col=1, min_row=s0 + 1, max_row=s1))
+        color_series(ch, [BRANCH_COLORS[b] for b in branches])
+        charts.append(ch)
+
+        s0, s1 = block(["Filial", "Yeni müraciət", "Təkrar müraciət"],
+                       [[b, fb.loc[b, "YENI_QEBUL"], fb.loc[b, "TEKRAR_QEBUL"]] for b in branches])
+        ch = style_chart(BarChart(), "Qəbul strukturu: yeni və təkrar müraciət")
+        ch.type, ch.grouping, ch.overlap, ch.gapWidth = "col", "stacked", 100, 55
+        ch.add_data(Reference(cd, min_col=2, max_col=3, min_row=s0, max_row=s1), titles_from_data=True)
+        ch.set_categories(Reference(cd, min_col=1, min_row=s0 + 1, max_row=s1))
+        color_series(ch, [C_ACCENT, "A9C4EB"])
+        charts.append(ch)
+
+    if not hek.empty:
+        t10 = hek[hek["PERSKODU"] != "—"].sort_values("SATIS", ascending=False).head(10)
+        s0, s1 = block(["Həkim", "Satış"], [[f"{r_.PERSADI} ({r_.FILIAL})", r_.SATIS] for r_ in t10.itertuples()])
+        ch = style_chart(BarChart(), "Top-10 həkim: satış məbləği (AZN)")
+        ch.type, ch.gapWidth = "bar", 40
+        ch.add_data(Reference(cd, min_col=2, min_row=s0, max_row=s1), titles_from_data=True)
+        ch.set_categories(Reference(cd, min_col=1, min_row=s0 + 1, max_row=s1))
+        ch.x_axis.scaling.orientation = "maxMin"
+        ch.legend = None
+        ch.dataLabels = DataLabelList()
+        ch.dataLabels.showVal = True
+        ch.dataLabels.showSerName = ch.dataLabels.showCatName = False
+        ch.dataLabels.showLegendKey = ch.dataLabels.showPercent = False
+        ch.dataLabels.numFmt = "#,##0"
+        color_series(ch, [C_NAVY2])
+        charts.append(ch)
+
+    if branches and m.get("has_hak") and "DOVRIYYE" in q:
+        RR = m.get("_R")
+        if RR:
+            s0, s1 = block(["Bölmə"] + branches, [[GROUP_LABEL[g]] + [
+                f'=SUMIFS({RR("DOVRIYYE")},{RR("QRUP_AD")},"{GROUP_LABEL[g]}",{RR("FILIAL")},"{b}")' for b in branches]
+                for g in GROUP_ORDER])
+        else:
+            piv = q.pivot_table(index="QRUP", columns="FILIAL", values="DOVRIYYE", aggfunc="sum").reindex(GROUP_ORDER).fillna(0)
+            s0, s1 = block(["Bölmə"] + branches, [[GROUP_LABEL[g]] + [piv.loc[g].get(b, 0) for b in branches] for g in GROUP_ORDER])
+        ch = style_chart(BarChart(), "Xalis dövriyyə (AZN): bölmələr üzrə")
+        ch.type, ch.grouping, ch.gapWidth = "col", "clustered", 60
+        ch.add_data(Reference(cd, min_col=2, max_col=1 + len(branches), min_row=s0, max_row=s1), titles_from_data=True)
+        ch.set_categories(Reference(cd, min_col=1, min_row=s0 + 1, max_row=s1))
+        color_series(ch, [BRANCH_COLORS.get(b, C_ACCENT) for b in branches])
+        charts.append(ch)
+    if branches and "DERMAN_GELIR" in f:
+        RR = m.get("_R")
+        TL = f'"{TOTAL_LABEL}"'
+        s0, s1 = block(["Filial", "Xidmət satışı", "Dərman satışı"],
+                       [[b, f'=SUMIFS({RR("SATIS")},{RR("QRUP_AD")},{TL},{RR("FILIAL")},"{b}")',
+                         f'=SUMIFS({RR("DERMAN_GELIR")},{RR("QRUP_AD")},{TL},{RR("FILIAL")},"{b}")'] if RR else
+                        [b, fb.loc[b, "SATIS"], fb.loc[b, "DERMAN_GELIR"]] for b in branches])
+        ch = style_chart(BarChart(), "Satış strukturu: xidmət və dərman (AZN)")
+        ch.type, ch.grouping, ch.overlap, ch.gapWidth = "col", "stacked", 100, 55
+        ch.add_data(Reference(cd, min_col=2, max_col=3, min_row=s0, max_row=s1), titles_from_data=True)
+        ch.set_categories(Reference(cd, min_col=1, min_row=s0 + 1, max_row=s1))
+        color_series(ch, [C_NAVY2, "DB2777"])
+        charts.append(ch)
+    dtop = (m.get("drug") or {}).get("lines")
+    if dtop is not None and not dtop.empty:
+        c = dtop[dtop["FORMTYPE"].isin([1, 2, 3])].copy()
+        c["X"] = c["DERMAN_MAYA"] + c["PAKET_MAYA"] + c["SERFIYYAT"]
+        t10 = c.groupby(["DERMAN_AD", "FILIAL"])["X"].sum().sort_values(ascending=False).head(10).reset_index()
+        if not t10.empty:
+            s0, s1 = block(["Dərman", "Xərc"], [[f"{str(r_.DERMAN_AD)[:38]} ({r_.FILIAL})", r_.X] for r_ in t10.itertuples()])
+            ch = style_chart(BarChart(), "Top-10 dərman: xərc (AZN)")
+            ch.type, ch.gapWidth = "bar", 40
+            ch.add_data(Reference(cd, min_col=2, min_row=s0, max_row=s1), titles_from_data=True)
+            ch.set_categories(Reference(cd, min_col=1, min_row=s0 + 1, max_row=s1))
+            ch.x_axis.scaling.orientation = "maxMin"
+            ch.legend = None
+            ch.dataLabels = DataLabelList()
+            ch.dataLabels.showVal = True
+            ch.dataLabels.showSerName = ch.dataLabels.showCatName = False
+            ch.dataLabels.showLegendKey = ch.dataLabels.showPercent = False
+            ch.dataLabels.numFmt = "#,##0"
+            color_series(ch, ["DB2777"])
+            charts.append(ch)
+
+    for i, ch in enumerate(charts):
+        anchor = f"{'B' if i % 2 == 0 else 'I'}{top + 1 + (i // 2) * 19}"
+        ws.add_chart(ch, anchor)
+    return len(charts)
+
+
+def build_notes(ws, m, start, end_incl, status):
+    ws.sheet_view.showGridLines = False
+    ws.sheet_properties.tabColor = "7F8C8D"
+    for col, w in zip("ABCD", (26, 34, 40, 80)):
+        ws.column_dimensions[col].width = w
+    band(ws, "A1:D1", "METODOLOGİYA VƏ İZAHAT QEYDLƏRİ", size=14, bg=C_NAVY, height=32)
+    r = 3
+    days = (end_incl - start).days + 1
+    meta = [
+        ("Hesabat dövrü", f"{start:%d.%m.%Y} – {end_incl:%d.%m.%Y} (hər iki gün daxil, {days} gün)"),
+        ("Hazırlanma tarixi", f"{datetime.now():%d.%m.%Y %H:%M}"),
+        ("Məlumat mənbəyi", "FONET klinika idarəetmə sistemi — xidmət, pasiyent qeydiyyatı və stasionar jurnalı"),
+        ("Əhatə olunan filiallar", "; ".join(f"{s['FILIAL']}: {'daxildir' if s['OK'] else 'məlumat alınmadı — daxil deyil'}" for s in status)),
+        ("Hazırlayan", PREPARED_BY),
+    ]
+    for lbl, val in meta:
+        ws.cell(row=r, column=1, value=lbl).font = font(10, True)
+        ws.merge_cells(start_row=r, start_column=2, end_row=r, end_column=4)
+        ws.cell(row=r, column=2, value=val).font = font(10)
+        for c in range(1, 5):
+            ws.cell(row=r, column=c).border = BORDER
+            ws.cell(row=r, column=c).fill = fill(C_ZEBRA)
+        r += 1
+    r += 1
+
+    def section(title, headers, rows_, heights=None):
+        nonlocal r
+        band(ws, f"A{r}:D{r}", title, size=11, bg="DCE6F5", fg=C_NAVY, height=24)
+        r += 1
+        if headers:
+            for i, h in enumerate(headers, 1):
+                c = ws.cell(row=r, column=i, value=h)
+                c.fill, c.font, c.border = fill(C_NAVY2), font(9, True, "FFFFFF"), BORDER
+                c.alignment = Alignment(horizontal="center", vertical="center")
+            r += 1
+        for rw in rows_:
+            if len(rw) == 2:
+                ws.merge_cells(start_row=r, start_column=2, end_row=r, end_column=4)
+            for i, v in enumerate(rw, 1):
+                c = ws.cell(row=r, column=i, value=v)
+                c.font = font(9, bold=(i == 1 or (len(rw) == 4 and i == 2)))
+                c.alignment = Alignment(vertical="center", wrap_text=True)
+            for i in range(1, 5):
+                ws.cell(row=r, column=i).border = BORDER
+            longest = max(len(str(v)) for v in rw[1:])
+            ws.row_dimensions[r].height = max(30, min(15 * (longest // 85 + 1 + str(rw[-1]).count("\n")), 120))
+            r += 1
+        r += 1
+
+    section("1. VƏRƏQLƏR", ["Vərəq", "Bəndlər", "Nə göstərir", "Səviyyə"], [
+        ("Rəhbərlik Paneli", "Xülasə", "Əsas göstəricilər, Filial × Bölmə matrisləri, avtomatik müşahidələr və qrafiklər. Bütün rəqəmlər 'Filiallar üzrə Müqayisə' vərəqindən canlı düsturla götürülür.", "Filial + Bölmə"),
+        ("Filiallar üzrə Müqayisə", "Bənd 12", "Eyni profilli bölmələrin filiallar üzrə müqayisəsi + hər filialın cəmi. Unikal saylar bu səviyyədə ayrıca hesablanır (şöbələrin toplanması deyil).", "Filial + Bölmə"),
+        ("Rentabellik", "Bənd 16–17", "Bölmələr üzrə cəmi satış, dərman xərci, həkim qazancı, xalis dövriyyə və marja.", "Filial + Bölmə"),
+        ("Dərman Sərfi", "Bənd 13–15", "Bölmələr üzrə dərman satışı və onun ödəniş növləri, maya dəyəri, marja, paketə daxil və şöbə daxili sərfiyyat, qəbul başına dərman xərci.", "Filial + Bölmə"),
+        ("Dərman Reytinqi", "Bənd 15", "Hər bölmədə xərcə görə ən çox istifadə olunan 15 dərman.", "Filial + Bölmə + Dərman"),
+        ("Təşkilatlar üzrə Satış", "Bənd 6", "Dövrdə satışı olmuş bütün sığorta, İcbari tibbi sığorta və korporativ təşkilatlar: xidmət və dərman üzrə təşkilatın payı.", "Filial + Təşkilat"),
+        ("Şöbələr üzrə İcmal", "Bənd 1–3, 5–8, 11", "Hər şöbə üzrə qəbul, yeni/təkrar müraciət, satış bölgüsü, hospitalizasiya və həkim məhsuldarlığı.", "Filial + Şöbə"),
+        ("Həkimlər üzrə Göstəricilər", "Bənd 4, 5", "Həkim üzrə qəbul, xidmət, satış, ödəniş mənbəyi, şöbə daxilində pay və yer.", "Filial + Şöbə + Həkim"),
+        ("Aylıq Dinamika", "Trend", "Ay üzrə satış və qəbul; natamam aylar üçün gündəlik orta göstəricilər müqayisəni düzgün edir.", "Filial + Bölmə + Ay"),
+        ("Göndərilən Yönləndirmələr", "Bənd 9, 10", "Bu bölmələrdən hesabatdan kənar şöbələrə (Laboratoriya, Radiologiya, digər) göndərilən xidmətlər.", "Göndərən → İcraçı"),
+        ("Daxil Olan Yönləndirmələr", "Bənd 10", "Digər şöbələrdən bu bölmələrə göndərilən xidmətlər (göndərəni qeyd olunmuş).", "Göndərən → Qəbul edən"),
+    ])
+
+    section("2. GÖSTƏRİCİLƏR NECƏ HESABLANIR", ["Bənd", "Göstərici", "Mənbə", "Hesablama qaydası"], [
+        ("Bənd 1", "Ambulator, stasionar və cəmi qəbul", "Xidmət qeydləri", "Hər pasiyent müraciəti bir dəfə sayılır — müraciətdə neçə xidmət göstərilməsindən asılı olmayaraq. Bir müraciət eyni bölmənin bir neçə şöbəsini (məs. Pediatriya və Peyvənd) əhatə edirsə, bölmə cəmində bir dəfə sayılır."),
+        ("Bənd 1", "Pasiyent sayı", "Pasiyent qeydiyyatı", "Dövrdə müraciət etmiş fərqli şəxslərin sayı. Qəbul sayı ÷ pasiyent sayı = bir pasiyentin orta gəliş sayı."),
+        ("Bənd 2", "Yeni pasiyent və təkrar müraciət", "Pasiyent qeydiyyatı", "Müraciət pasiyentin həmin filiala İLK müraciətidirsə — 'Yeni pasiyent', əks halda — 'Təkrar müraciət'. Dövrdə 3 dəfə gələn yeni pasiyent: 1 yeni + 2 təkrar. Yeni + Təkrar = Cəmi qəbul."),
+        ("Bənd 3", "Aktiv həkim sayı", "Xidmət qeydləri", "Dövrdə ən azı bir xidmət göstərmiş həkimlər. Bir neçə şöbədə çalışan həkim bölmə və filial cəmində bir dəfə sayılır."),
+        ("Bənd 4–5", "Xidmət satışı", "Xidmət qeydləri", "Göstərilmiş bütün xidmətlər üzrə pasiyentin ödədiyi hissə + qurumun (sığorta, korporativ) ödədiyi hissə. Geri qaytarılmış xidmətlər məbləğdən çıxılıb."),
+        ("Bənd 6", "Ödəniş bölgüsü", "Xidmət və dərman qeydləri", "• Nağd — pasiyentin özünün ödədiyi hissə (sığortalı pasiyentin franşiza/fərq ödənişi də daxil).\n• Sığorta — könüllü tibbi sığorta şirkətlərinin ödədiyi hissə.\n• İcbari tibbi sığorta (İTS) — dövlət icbari sığortasının ödədiyi hissə.\n• Korporativ / digər — müqaviləli təşkilatların ödədiyi hissə.\nÖdəniş növü pasiyentin sinfinə və təşkilatın adına görə təyin olunur (filiallarda sinif adları fərqli olduğu üçün hər filialda eyni qayda tətbiq edilir). İcbari tibbi sığorta bəzi filiallarda ayrıca xəstə növü (Mərkəz), digərlərində sığorta xəstəsinin təşkilatı kimi qeyd olunur — hər iki halda eyni 'İTS' sütununa düşür, ona görə filiallar müqayisə oluna bilir. Dərmanda pasiyentə ödənişli yazılan dərman — nağd, təşkilat hesabına yazılan — təşkilatın növünə görə.\nNağd + Sığorta + İTS + Korporativ = Satış (xidmət və dərman üçün ayrıca)."),
+        ("Bənd 7", "Orta çek", "Hesablanan", "Xidmət satışı ÷ Cəmi qəbul (dərman daxil deyil)."),
+        ("Bənd 8", "Hospitalizasiya və orta yatış müddəti", "Stasionar jurnalı", "Dövrdə stasionara yerləşdirilmiş pasiyentlərin sayı. Reanimasiyadan palataya keçid bir hospitalizasiya sayılır. Orta yatış müddəti evə yazılmış pasiyentlər üzrə hesablanır (eyni gün çıxış = 1 gün); müalicəsi davam edənlər ayrıca göstərilir."),
+        ("Bənd 9–10", "Yönləndirmələr", "Xidmət qeydləri", "Göndərilən — bu bölmələrin həkimlərinin digər şöbələrə (laboratoriya, radiologiya və s.) təyin etdiyi xidmətlər. Daxil olan — digər şöbələrin bu bölmələrə göndərdiyi xidmətlər. Hesabat bölmələrinin öz aralarındakı keçidlər təkrar sayılmasın deyə buraya daxil edilmir."),
+        ("Bənd 11", "Həkim başına göstəricilər", "Hesablanan", "Həkim başına qəbul = Cəmi qəbul ÷ Aktiv həkim sayı; Həkim başına satış = Satış məbləği ÷ Aktiv həkim sayı."),
+        ("Bənd 13", "Dərman satışı, marja", "Dərman çıxışları", "Pasiyentə yazılan, paketə daxil olmayan dərmanların satış məbləği. Marja = satış − həmin dərmanların alış (maya) dəyəri. Dərman satışı xidmət satışına daxil deyil; Cəmi satış = Xidmət satışı + Dərman satışı. Dərman pasiyenti göndərən (istəyən) şöbəyə yazılır."),
+        ("Bənd 14", "Dərman xərci", "Dərman çıxışları", "Cəmi dərman xərci = satılan dərmanın maya dəyəri + paketə daxil dərman (ayrıca satılmır) + şöbə daxili sərfiyyat. Şöbə daxili sərfiyyat — şöbə deposundan istifadə edilib silinmiş materiallardır. İnventar yerdəyişməsi və şöbələrarası ötürmələr xərc deyil, daxil edilmir. Korporativ məntəqələrə çıxış ayrıca göstərilir. Qəbul başına dərman xərci = Cəmi dərman xərci ÷ Cəmi qəbul."),
+        ("Bənd 15", "Təchizat", "Dərman çıxışları", "Aptek və anbardan şöbə depolarına verilən dərmanlar. Məlumat xarakterlidir: həmin dərmanlar sonradan pasiyentə verildikdə və ya sərf edildikdə xərcə düşür, buna görə ikinci dəfə toplanmır."),
+        ("Bənd 16", "Həkim qazancı", "Həkim hakedişləri", "Seçilmiş dövrdə göstərilən xidmətlər üzrə həkimlərə hesablanmış hakediş: icra edən həkimin və göndərən həkimin payı. Xidmətin icra edildiyi şöbəyə yazılır."),
+        ("Bənd 17", "Xalis dövriyyə və marja", "Hesablanan", "Xalis dövriyyə = Cəmi satış (xidmət + dərman) − Cəmi dərman xərci − Həkim qazancı. Dövriyyə marjası = Xalis dövriyyə ÷ Cəmi satış. Əmək haqqı (hakedişdən kənar), inzibati, kommunal və digər xərclər daxil deyil — bu, xalis mənfəət deyil."),
+        ("Bənd 12", "Filial müqayisəsi", "Hesablanan", "Filiallarda fərqli adlanan şöbələr vahid bölmələrə birləşdirilib (aşağıdakı 3-cü bölmə). Ümumi göstəricilər filial göstəricilərinin cəmidir."),
+    ])
+
+    rows_ = []
+    for b, cfg in BRANCHES.items():
+        txt = "\n".join(f"{GROUP_LABEL[g]}: {', '.join(ds)}." for g, ds in cfg["groups"].items() if ds)
+        dep = cfg.get("depots", {})
+        if dep:
+            txt += "\nDərman/təsərrüfat depoları: " + "; ".join(f"{GROUP_LABEL[g]} — {', '.join(ds)}" for g, ds in dep.items()) + "."
+        rows_.append((f"{b} filialı", txt))
+    section("3. BÖLMƏLƏRƏ DAXİL EDİLƏN ŞÖBƏLƏR (təsərrüfat, anbar və kassa bölmələri xaric)", None, rows_)
+
+    cav = [
+        ("Maliyyə", "Rəqəmlər hesablanmış satış həcmidir; xərclər çıxılmış xalis mənfəət deyil."),
+        ("Sığorta", "Sığorta məbləğləri sığorta şirkətinə hesablanan (faktura edilən) məbləğdir; sonradan tətbiq oluna biləcək imtina/kəsintilər nəzərə alınmayıb."),
+        ("Yönləndirmələr", "Yalnız sistemdə göndərən şöbəsi qeyd olunmuş təyinatlar sayılır; şifahi yönləndirmələr bu göstəriciyə düşmür."),
+        ("Yeni pasiyent", "'Yeni' — filial daxilində ilk müraciətdir. Başqa filialda əvvəl müalicə almış pasiyent bu filialda yeni sayılır."),
+        ("Korporativ TTY", "Babək filialının xidmət göstərdiyi kənar müəssisə məntəqələri (Saipem, ST Clinic, Xazar OH, Gəmi 2 və s.) daxili TTY göstəricilərinə qatılmayıb."),
+        ("Dərman qiymətləri", "Dərman satışı pasiyentə yazılmış qiymətlə, xərc isə alış (maya) qiyməti ilə hesablanır; sonradan tətbiq edilən endirim və sığorta kəsintiləri nəzərə alınmayıb."),
+        ("Natamam aylar", "Dövrün ilk və son ayı tam deyil; aylar arası müqayisə gündəlik orta göstəricilərlə aparılır."),
+        ("Rəqəm formatı", "Onluq ayırıcı — vergül, minlik ayırıcı — nöqtə (məs. 1.328.543,36 AZN)."),
+    ]
+    section("4. RƏHBƏRLİK ÜÇÜN QEYDLƏR", None, cav)
+    rows_ = []
+    for k in COLS:
+        if k not in SHEET_KEYS:
+            continue
+        how = "Excel düsturu (canlı)" if k in FORMULA_KEYS else "Sistem məlumatından hesablanır"
+        rows_.append((COLS[k][0], ", ".join(SHEET_KEYS[k]), how, COL_DOC.get(k, "—")))
+    aid = (m.get("drug") or {}).get("aid", pd.DataFrame())
+    ex = ""
+    if not aid.empty:
+        a = aid.assign(F=(aid["V_SATIS"] - aid["I_SATIS"]).abs()).sort_values("F", ascending=False).iloc[0]
+        ex = (f"Nümunə (bu dövr): {a['FILIAL']} — {a['QRUP_AD']}: 'İstəyən şöbə' qaydası ilə {fmt_az(a['I_SATIS'])} AZN, "
+              f"'Verən depo' qaydası ilə {fmt_az(a['V_SATIS'])} AZN. Səbəb: {a['AIDIYYET_IZAH'].split(';')[0]}.")
+    section("5. DƏRMAN AİDİYYƏTİ — İKİ QAYDA VƏ SEÇİM", None, [
+        ("Seçim harada", "'Rəhbərlik Paneli' vərəqində, D8 xanasındakı açılan siyahı. Seçimi dəyişən kimi Excel bütün "
+                         "dərman göstəricilərini yenidən hesablayır; skripti yenidən işə salmaq lazım deyil."),
+        ("İstəyən şöbə (standart)", "Pasiyentə verilən dərman pasiyenti təyin edən şöbəyə yazılır — hansı depodan verilməsindən "
+                                    "asılı olmayaraq. Öz deposu olmayan şöbələr (məs. poliklinika şöbələri dərmanı ümumi "
+                                    "depodan alır) yalnız bu qaydada dərman satışı ilə görünür. FONET-in şöbə üzrə dərman "
+                                    "ekranı da bu qaydaya uyğundur."),
+        ("Verən depo", "Pasiyentə verilən dərman fiziki olaraq çıxdığı depoya yazılır. Depo hesabata daxil olan bölməyə aid "
+                       "deyilsə (Poliklinika, Əməliyyatxana, Anesteziya və s.), dərman heç bir bölməyə düşmür. Depo idarəçiliyi "
+                       "və stok nəzarəti üçün faydalıdır."),
+        ("Nə dəyişir", "Dərman satışı və onun ödəniş bölgüsü, satılan dərmanın maya dəyəri, paketə daxil dərman, cəmi dərman "
+                       "xərci, dərman marjası, cəmi satış, xalis dövriyyə və marja — paneldə, 'Filiallar üzrə Müqayisə', "
+                       "'Rentabellik', 'Dərman Sərfi', 'Dərman — Bölmə Tərkibi', 'Şöbələr üzrə İcmal' vərəqlərində və "
+                       "qrafiklərdə."),
+        ("Nə dəyişmir", "Şöbə daxili sərfiyyat həmişə depo üzrədir (şöbənin öz deposundan silinir). Xidmət satışı, qəbul, "
+                        "həkim qazancı, 'Həkimlər' vərəqindəki dərman (həkim təyin etdiyi üçün həmişə istəyən şöbə üzrə), "
+                        "'Dərman Reytinqi' və panelin mətn şərhləri standart qaydadadır."),
+        ("Müqayisə", "'Dərman — Aidiyyət' vərəqi hər bölmə üçün iki qaydanın nəticəsini yan-yana və fərqi yaradan şöbə ↔ depo "
+                     "axınlarını göstərir. 'Dərman — Məlumat' vərəqində hər sətir üçün istəyən şöbə və verən depo var. "
+                     + ex),
+    ])
+    section("6. SÜTUNLARIN İZAHI — hər sütun necə formalaşır", ["Sütun", "Hansı vərəqlərdə", "Necə hesablanır",
+                                                                "Formalaşma qaydası"], rows_)
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.fitToWidth, ws.page_setup.fitToHeight = 1, 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+
+
+def build_workbook(m, start, end_incl, status, path):
+    SHEET_KEYS.clear()
+    FORMULA_KEYS.clear()
+    wb = Workbook()
+    S = {"dash": "Rəhbərlik Paneli", "cmp": "Filiallar üzrə Müqayisə", "dept": "Şöbələr üzrə İcmal",
+         "rent": "Rentabellik", "drug": "Dərman Sərfi", "drugcomp": "Dərman — Bölmə Tərkibi", "drugtop": "Dərman Reytinqi", "org": "Təşkilatlar üzrə Satış",
+         "hek": "Həkimlər üzrə Göstəricilər", "ay": "Aylıq Dinamika", "geden": "Göndərilən Yönləndirmələr",
+         "gelen": "Daxil Olan Yönləndirmələr", "notes": "Metodologiya və Qeydlər",
+         "drugaid": "Dərman — Aidiyyət", "drugdata": "Dərman — Məlumat"}
+    ws_d = wb.active
+    ws_d.title = S["dash"]
+    for k in ["cmp", "rent", "dept", "drug", "drugcomp", "drugaid", "drugtop", "org", "hek", "ay", "geden", "gelen",
+              "drugdata", "notes"]:
+        wb.create_sheet(S[k])
+    # Dərman aidiyyəti seçimi: Rəhbərlik Panelindəki açılan siyahı (D8) — bütün dərman düsturları ona baxır
+    wb.defined_names[AID_NAME] = DefinedName(AID_NAME, attr_text=f"'{S['dash']}'!{AID_CELL_ABS}")
+    dr_ = m.get("drug") or {}
+    p12 = dr_.get("p12", pd.DataFrame())
+    dd_info = write_table(wb[S["drugdata"]], p12, ["FILIAL", "ISTEYEN", "I_QRUP_AD", "DEPOADI", "V_QRUP_AD", "PAKET",
+                                                    "ODENIS_NOVU", "SATIR", "D_SATIS", "MAYA"],
+                          "DƏRMAN — MƏLUMAT: pasiyentə verilən dərmanlar (hər iki aidiyyət qaydası üçün)",
+                          "Hər sətir: hansı şöbə istəyib, hansı depodan verilib. Panel və dərman vərəqlərindəki rəqəmlər "
+                          "bu cədvəldən seçilmiş qaydaya görə toplanır. Boş bölmə — şöbə/depo hesabata daxil deyil.",
+                          tab="7F8C8D", freeze_after=7, total_key="__yox__")
+    DF = drug_formulas(S["drugdata"], dd_info) if not p12.empty else {}
+    wb.create_sheet("_qrafik").sheet_state = "hidden"
+    period = f"Dövr: {start:%d.%m.%Y} – {end_incl:%d.%m.%Y}  ·  Hazırlayan: {PREPARED_BY}  ·  Rəng şkalası: yaşıl — sütunda yüksək, qırmızı — aşağı göstərici"
+
+    cmp_keys = ["QRUP_AD", "FILIAL", "AMB_QEBUL", "STAS_QEBUL", "CEMI_QEBUL", "UNIKAL_PASIYENT", "YENI_QEBUL",
+                "TEKRAR_QEBUL", "YENI_PAY", "HEKIM_SAYI", "SATIS", "NAGD", "SIGORTA", "ITS", "KORPORATIV", "NAGD_PAY",
+                "SIG_PAY", "ITS_PAY", "KORP_PAY", "ORTA_CEK", "FILIAL_PAY", "HOSP_SAYI", "HELE_YATAN", "TAXIS_SAYI", "ORTA_YATIS",
+                "HEKIM_BASI_QEBUL", "HEKIM_BASI_SATIS",
+                "DERMAN_GELIR", "DERMAN_NAGD", "DERMAN_SIG", "DERMAN_ITS", "DERMAN_KORP",
+                "DERMAN_MAYA", "DERMAN_MARJA", "PAKET_MAYA", "SERFIYYAT", "DERMAN_XERC", "CEMI_GELIR"]
+    if m.get("has_hak"):
+        cmp_keys += ["HK_YAPAN", "HK_GONDEREN", "HEKIM_QAZANC", "DOVRIYYE", "DOVRIYYE_MARJA"]
+    fil_pay = {"FILIAL_PAY": f'=IFERROR({{SATIS}}/SUMIFS({{COL:SATIS}},{{COL:FILIAL}},{{FILIAL}},{{COL:QRUP_AD}},"{TOTAL_LABEL}"),0)'}
+    cmp_info = write_table(wb[S["cmp"]], m["cmp"], cmp_keys, "FİLİALLAR ÜZRƏ MÜQAYİSƏ — Bölmə qrupları", period,
+                           extra_formulas={**fil_pay, **DF.get("grp", {})}, databars=["SATIS"], scales=["ORTA_CEK", "YENI_PAY", "HEKIM_BASI_SATIS"],
+                           tab="2F5597", freeze_after=2)
+    dept_keys = ["FILIAL", "QRUP_AD", "SR_ADI"] + cmp_keys[2:] + ["QEBUL_BASI_DERMAN"]
+    # Şöbə vərəqində "Filial cəmi" sətri yoxdur; satış toplanan olduğu üçün filialın şöbələr cəmi = filial cəmi
+    dept_fil_pay = {"FILIAL_PAY": "=IFERROR({SATIS}/SUMIFS({COL:SATIS},{COL:FILIAL},{FILIAL}),0)"}
+    write_table(wb[S["dept"]], m["dept"], dept_keys, "ŞÖBƏLƏR ÜZRƏ İCMAL", period,
+                extra_formulas={**dept_fil_pay, **DF.get("sobe", {})},
+                databars=["SATIS"], scales=["ORTA_CEK"], tab="00A3A1", freeze_after=3)
+    hek_keys = ["FILIAL", "QRUP_AD", "SR_ADI", "PERSADI", "CEMI_QEBUL", "UNIKAL_PASIYENT", "XIDMET_SATIRI",
+                "SATIS", "NAGD", "SIGORTA", "ITS", "KORPORATIV", "ORTA_CEK", "SOBE_PAY", "SOBE_RANK",
+                "DERMAN_GELIR", "DERMAN_MAYA", "MARJA_PAY"] + (["HEKIM_QAZANC"] if m.get("has_hak") else [])
+    hek_f = {"SOBE_PAY": "=IFERROR({SATIS}/SUMIFS({COL:SATIS},{COL:FILIAL},{FILIAL},{COL:SR_ADI},{SR_ADI}),0)",
+             "SOBE_RANK": '=COUNTIFS({COL:FILIAL},{FILIAL},{COL:SR_ADI},{SR_ADI},{COL:SATIS},">"&{SATIS})+1'}
+    write_table(wb[S["hek"]], m["hekim"], hek_keys, "HƏKİMLƏR ÜZRƏ GÖSTƏRİCİLƏR", period, extra_formulas=hek_f,
+                databars=["SATIS", "CEMI_QEBUL"], scales=["ORTA_CEK"], tab="F28E2B", freeze_after=4)
+    drug_keys = ["QRUP_AD", "FILIAL", "CEMI_QEBUL", "HOSP_SAYI", "SATIS", "DERMAN_GELIR", "CEMI_GELIR", "DERMAN_PAY",
+                 "DERMAN_NAGD", "DERMAN_SIG", "DERMAN_ITS", "DERMAN_KORP",
+                 "DERMAN_NAGD_PAY", "DERMAN_SIG_PAY", "DERMAN_ITS_PAY", "DERMAN_KORP_PAY",
+                 "DERMAN_MAYA", "DERMAN_MARJA", "MARJA_PAY", "PAKET_MAYA", "SERFIYYAT", "DERMAN_XERC",
+                 "QEBUL_BASI_DERMAN", "TECHIZAT", "KORP_MENTEQE"]
+    if m.get("has_hak"):
+        write_table(wb[S["rent"]], m["cmp"],
+                    ["QRUP_AD", "FILIAL", "CEMI_QEBUL", "SATIS", "DERMAN_GELIR", "CEMI_GELIR", "DERMAN_MAYA",
+                     "PAKET_MAYA", "SERFIYYAT", "DERMAN_XERC", "HK_YAPAN", "HK_GONDEREN", "HEKIM_QAZANC", "HEKIM_PAY",
+                     "DOVRIYYE", "DOVRIYYE_MARJA", "DOVRIYYE_QEBUL"],
+                    "RENTABELLİK — satış, dərman xərci, həkim qazancı və xalis dövriyyə", period + AID_SUBTITLE,
+                    extra_formulas=DF.get("grp", {}),
+                    databars=["DOVRIYYE"], scales=["DOVRIYYE_MARJA", "DOVRIYYE_QEBUL"], tab="F5B700", freeze_after=2)
+    else:
+        ws_r = wb[S["rent"]]
+        band(ws_r, "A1:H1", "RENTABELLİK", size=14, bg=C_NAVY, height=30)
+        ws_r["A3"] = "Həkim qazancı məlumatı alınmadığı üçün bu vərəq boşdur (nəzarət faylına baxın)."
+    write_table(wb[S["drug"]], m["cmp"], drug_keys, "DƏRMAN SƏRFİ — satış, ödəniş növü, marja və xərc",
+                period + AID_SUBTITLE + "  ·  Bölmələrin tərkibi — 'Dərman — Bölmə Tərkibi', iki qaydanın müqayisəsi — 'Dərman — Aidiyyət' vərəqində",
+                extra_formulas=DF.get("grp", {}),
+                databars=["DERMAN_XERC"], scales=["MARJA_PAY", "QEBUL_BASI_DERMAN"], tab="DB2777", freeze_after=2)
+    write_table(wb[S["drugcomp"]], m.get("drug_comp", pd.DataFrame()),
+                ["FILIAL", "QRUP_AD", "OBYEKT", "NOV", "DERMAN_GELIR", "DERMAN_MAYA", "PAKET_MAYA", "SERFIYYAT",
+                 "DERMAN_XERC", "QRUP_PAY", "TECHIZAT"],
+                "DƏRMAN — BÖLMƏLƏRİN TƏRKİBİ: hər bölməyə hansı şöbə və depolar birləşdirilib",
+                period + AID_SUBTITLE + "  ·  'Bölmə cəmi' sətri 'Dərman Sərfi' vərəqindəki həmin bölmənin rəqəminə bərabərdir",
+                extra_formulas={**DF.get("comp", {}),
+                                "QRUP_PAY": f'=IFERROR({{DERMAN_XERC}}/SUMIFS({{COL:DERMAN_XERC}},{{COL:FILIAL}},{{FILIAL}},'
+                                            f'{{COL:QRUP_AD}},{{QRUP_AD}},{{COL:NOV}},"{GROUP_SUBTOTAL}"),0)'},
+                tab="DB2777", freeze_after=4, total_key="NOV")
+    aid = dr_.get("aid", pd.DataFrame())
+    write_table(wb[S["drugaid"]], aid, ["FILIAL", "QRUP_AD", "I_SATIS", "V_SATIS", "FERQ_SATIS", "I_MAYA", "V_MAYA",
+                                        "AIDIYYET_IZAH"],
+                "DƏRMAN AİDİYYƏTİ — 'İstəyən şöbə' və 'Verən depo' qaydalarının müqayisəsi",
+                "İstəyən şöbə: dərman pasiyenti təyin edən şöbəyə yazılır (standart). Verən depo: dərman fiziki olaraq "
+                "çıxdığı depoya yazılır. Seçim — 'Rəhbərlik Paneli' vərəqində, D8 xanası.",
+                extra_formulas={"FERQ_SATIS": "={V_SATIS}-{I_SATIS}"}, databars=["I_SATIS", "V_SATIS"],
+                tab="DB2777", freeze_after=2)
+    dtop = (m.get("drug") or {}).get("top", pd.DataFrame())
+    write_table(wb[S["drugtop"]], dtop, ["FILIAL", "QRUP_AD", "DERMAN_RANK", "DERMAN_AD", "BIRIM", "MIQDAR",
+                                         "DERMAN_GELIR", "DERMAN_XERC", "QRUP_PAY"],
+                "DƏRMAN REYTİNQİ — hər bölmədə xərcə görə ilk 15 dərman", period,
+                databars=["DERMAN_XERC"], tab="DB2777", freeze_after=4)
+    write_table(wb[S["org"]], m.get("org", pd.DataFrame()),
+                ["FILIAL", "ODENIS_NOVU", "KURUM", "CEMI_QEBUL", "UNIKAL_PASIYENT", "TESKILAT_XIDMET", "PASIYENT_XIDMET",
+                 "DERMAN_TESKILAT", "TESKILAT_CEMI", "ORG_PAY"],
+                "TƏŞKİLATLAR ÜZRƏ SATIŞ — sığorta, İTS və korporativ təşkilatlar", period,
+                extra_formulas={"ORG_PAY": "=IFERROR({TESKILAT_CEMI}/SUMIFS({COL:TESKILAT_CEMI},{COL:FILIAL},{FILIAL}),0)"},
+                databars=["TESKILAT_CEMI"], tab="0E7490", freeze_after=3)
+    ay_keys = ["FILIAL", "QRUP_AD", "AY_AD", "GUN", "CEMI_QEBUL", "SATIS", "GUNLUK_QEBUL", "GUNLUK_SATIS", "ORTA_CEK"]
+    write_table(wb[S["ay"]], m["ay"], ay_keys, "AYLIQ DİNAMİKA",
+                period + "  ·  Natamam aylar üçün 'Gündəlik orta' sütunlarına baxın",
+                databars=["GUNLUK_SATIS"], tab="8E44AD", freeze_after=3)
+    write_table(wb[S["geden"]], m["geden"], ["FILIAL", "QRUP_AD", "GONDEREN_SOBE", "ICRACI_SOBE", "ITU_ADI", "IT_ADI",
+                                             "CEMI_QEBUL", "XIDMET_SATIRI", "SATIS", "NAGD", "SIGORTA", "ITS", "KORPORATIV"],
+                "GÖNDƏRİLƏN YÖNLƏNDİRMƏLƏR — hesabat bölmələrindən digər şöbələrə", period,
+                databars=["SATIS"], tab="27AE60", freeze_after=4)
+    write_table(wb[S["gelen"]], m["gelen"], ["FILIAL", "QRUP_AD", "QEBUL_EDEN_SOBE", "GONDEREN_SOBE", "ITU_ADI",
+                                             "CEMI_QEBUL", "XIDMET_SATIRI", "SATIS"],
+                "DAXİL OLAN YÖNLƏNDİRMƏLƏR — digər şöbələrdən hesabat bölmələrinə", period,
+                databars=["SATIS"], tab="27AE60", freeze_after=4)
+    build_notes(wb[S["notes"]], m, start, end_incl, status)
+    build_dashboard(wb, ws_d, m, cmp_info, start, end_incl, status, S)
+
+    wb.properties.title = "Filiallar üzrə şöbə fəaliyyət və satış hesabatı"
+    wb.properties.creator = PREPARED_BY
+    wb.active = 0
+    wb.save(path)
+    return path
+
+
+def build_control_workbook(m, start, end_incl, path):
+    """Yalnız hazırlayan üçün: uyğunluq yoxlamaları (rəhbərliyə göndərilmir)."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Nəzarət yoxlamaları"
+    info = write_table(ws, m["dq"], ["FILIAL", "YOXLAMA", "GOZLENILEN", "FAKTIKI", "FERQ", "NETICE", "SERH"],
+                       "DAXİLİ NƏZARƏT — HESABATIN UYĞUNLUQ YOXLAMALARI",
+                       f"Dövr: {start:%d.%m.%Y} – {end_incl:%d.%m.%Y}  ·  ✔ uğurlu · ⚠ diqqət · ✖ xəta · ℹ məlumat  ·  "
+                       f"Rəhbərliyə göndərməzdən əvvəl ✖ olmamalıdır", tab="C0392B", freeze_after=2)
+    colors = {"✔": ("D4EDDA", "1E7B34"), "⚠": ("FFF3CD", "8A6100"), "✖": ("F8D7DA", "A61B29"), "ℹ": ("E8EEF8", C_NAVY2)}
+    NL = info["letters"].get("NETICE")
+    if NL and not m["dq"].empty:
+        for r in range(info["r0"], info["r1"] + 1):
+            c = ws[f"{NL}{r}"]
+            bg, fg = colors.get(str(c.value)[:1], ("FFFFFF", "000000"))
+            c.fill, c.font = fill(bg), font(9, True, fg)
+        ws.column_dimensions["B"].width = 50
+    dr = m.get("drug") or {}
+    if not dr.get("summ", pd.DataFrame()).empty:
+        ws3 = wb.create_sheet("Dərman sərfi — mənbə")
+        write_table(ws3, dr["summ"], ["FILIAL", "QRUP_AD", "OBYEKT", "TIP", "XERCE_DAXIL", "SATIR", "D_SATIS", "MAYA"],
+                    "DƏRMAN SƏRFİ HARADAN FORMALAŞIB — şöbə/depo və çıxış növü üzrə",
+                    "Bölmənin dərman xərci = 'Dərman xərcinə daxildir: Bəli' sətirlərinin maya dəyəri cəmi. "
+                    "Filtrlə: Filial → Bölmə qrupu. Dərman səviyyəsində təfərrüat — növbəti vərəqdə.",
+                    databars=["MAYA"], tab="DB2777", freeze_after=4)
+        COLS.setdefault("SATIR", ("Sətir sayı", "int"))
+        ws4 = wb.create_sheet("Dərman sərfi — detal")
+        write_table(ws4, dr["det"], ["FILIAL", "QRUP_AD", "OBYEKT", "TIP", "XERCE_DAXIL", "ISTEYEN", "DEPOADI",
+                                     "CIKIS_YERI", "DERMAN_AD", "BIRIM", "ODENIS_NOVU", "KURUM", "MIQDAR", "D_SATIS", "MAYA"],
+                    "DƏRMAN SƏRFİ — DƏRMAN SƏVİYYƏSİNDƏ DETAL",
+                    "Hər sətir: hansı dərman, hansı depodan, kimə/hara, hansı ödəniş növü ilə. Filtrlərdən istifadə edin.",
+                    tab="DB2777", freeze_after=4)
+    dest = dr.get("dest", pd.DataFrame())
+    if not dest.empty:
+        ws2 = wb.create_sheet("Dərman istiqamətləri")
+        dest = dest.sort_values(["FILIAL", "SINIF", "MAYA"], ascending=[True, True, False])
+        write_table(ws2, dest, ["FILIAL", "DEPOADI", "CIKIS_YERI", "SINIF", "MAYA"],
+                    "ŞÖBƏ DEPOLARINDAN 'DİGƏR ÇIXIŞLAR' — İSTİQAMƏT TƏSNİFATI",
+                    "Yalnız 'Şöbə sərfiyyatı' xərcə daxildir. Səhv təsnif olunan istiqamət varsa, skriptdə DRUG_*_KEYS siyahılarını düzəldin.",
+                    databars=["MAYA"], tab="DB2777", freeze_after=4)
+    wb.save(path)
+    return path
+
+
+# =====================================================================================
+# 6b. ŞÖBƏ / BÖLMƏ SEÇİMİ (dinamik)
+# =====================================================================================
+CUSTOM_EXCLUDE = ["KASSA", "VEZNE", "TESERRUF", "TƏSƏRRÜF", "TƏSƏRRUF", "DEPO", "ANBAR", "AMBAR", "TULLANT",
+                  "CIHAZ", "ENVANTER", "INVENTAR", "TES."]
+CUSTOM_DEPOT_HINT = ["TESERRUF", "TƏSƏRRÜF", "TƏSƏRRUF", "TES.", "DƏRMAN DEPO", "DERMAN DEPO"]
+CUSTOM_DEPOT_EXCL = ["CIHAZ", "ENVANTER", "INVENTAR", "TULLANT"]
+
+
+_FOLD = str.maketrans("ƏəÇçĞğIıİiÖöŞşÜüEe", "EECCGGIIIIOOSSUUEE")
+
+
+def _fold(x):
+    """Yazılış fərqlərinə həssas olmayan müqayisə: Peyvənd = Peyvend = PEYVƏND, Təcili = Tecili."""
+    return " ".join(str(x or "").translate(_FOLD).upper().split())
+
+
+def _set_groups(pairs):
+    GROUPS[:] = pairs
+    GROUP_LABEL.clear()
+    GROUP_LABEL.update(dict(pairs))
+    GROUP_ORDER[:] = [c for c, _ in pairs]
+
+
+def select_standard(tokens):
+    """Standart bölmələrdən seçim: kod və ya adın başlanğıcı ilə (məs. 'ped,neo' və ya '1,3')."""
+    chosen = []
+    for t in [x.strip() for x in re.split(r"[,;]", tokens) if x.strip()]:
+        if t.isdigit() and 1 <= int(t) <= len(GROUPS):
+            chosen.append(GROUPS[int(t) - 1][0])
+            continue
+        tn = _fold(t)
+        hit = [c for c, lbl in GROUPS if _fold(c).startswith(tn) or _fold(lbl).startswith(tn)]
+        if not hit:
+            sys.exit(f"Bölmə tapılmadı: '{t}'. Mövcud bölmələr: " + ", ".join(l for _, l in GROUPS))
+        chosen += hit
+    keep = [c for c in GROUP_ORDER if c in chosen]
+    _set_groups([(c, GROUP_LABEL[c]) for c in keep])
+    for cfg in BRANCHES.values():
+        cfg["groups"] = {g: d for g, d in cfg["groups"].items() if g in keep}
+        cfg["depots"] = {g: d for g, d in cfg.get("depots", {}).items() if g in keep}
+
+
+def select_custom(keywords, names_by_branch):
+    """İstənilən şöbə(lər): hər açar söz ayrıca bölmə olur; hər filialda adında həmin söz olan şöbələr
+    (kassa/depo/anbar xaric) və həmin şöbənin təsərrüfat/dərman depoları avtomatik tapılır."""
+    kws = [k.strip() for k in re.split(r"[;,]", keywords) if k.strip()]
+    pairs = [(f"G{i + 1}", k[:1].upper() + k[1:]) for i, k in enumerate(kws)]
+    _set_groups(pairs)
+    print("\nSeçilmiş şöbələr:")
+    for b, cfg in BRANCHES.items():
+        names = sorted(set(names_by_branch.get(b, [])))
+        groups, depots, used = {}, {}, set()
+        for code, kw in pairs:
+            k = _fold(kw)
+            hits = [n for n in names if k in _fold(n) and n not in used]
+            ex = [_fold(x) for x in CUSTOM_EXCLUDE]
+            dh, de = [_fold(x) for x in CUSTOM_DEPOT_HINT], [_fold(x) for x in CUSTOM_DEPOT_EXCL]
+            groups[code] = [n for n in hits if not any(x in _fold(n) for x in ex)]
+            depots[code] = [n for n in hits if any(x in _fold(n) for x in dh) and not any(x in _fold(n) for x in de)]
+            used.update(groups[code] + depots[code])
+        cfg["groups"], cfg["depots"] = groups, depots
+        for code, kw in pairs:
+            print(f"  [{b}] {kw}: " + (", ".join(groups[code]) or "— tapılmadı —") +
+                  (f"  | depolar: {', '.join(depots[code])}" if depots[code] else ""))
+    MISSED_DEPT_PATTERNS[:] = [k.upper() for k in kws]
+
+
+def drop_empty_branches():
+    for b in list(BRANCHES):
+        if not all_depts(BRANCHES[b]):
+            print(f"  [{b}] seçilmiş şöbə yoxdur — filial hesabata daxil edilmir")
+            del BRANCHES[b]
+            BRANCH_ORDER.remove(b)
+    if not BRANCHES:
+        sys.exit("Seçimə uyğun heç bir şöbə tapılmadı.")
+
+
+def fetch_branch_names(demo):
+    """Hər filialın bütün şöbə/depo adları (istənilən şöbə seçimi üçün)."""
+    if demo:
+        return {b: drug_names(c) + ["Reanimasiya Şöbəsi", "Reanimasiya Teserrufat", "Kassa-1"] for b, c in BRANCHES.items()}
+    import oracledb
+    oracledb.init_oracle_client(lib_dir=ORACLE_CLIENT_DIR)
+    pw = os.environ.get("FONET_DB_PASS") or getpass.getpass(f"{DB_USER} üçün FONET parolu: ")
+    os.environ["FONET_DB_PASS"] = pw
+    out = {}
+    for b, c in BRANCHES.items():
+        try:
+            with oracledb.connect(user=DB_USER, password=pw, dsn=c["dsn"]) as conn:
+                out[b] = list(run_query(conn, "SELECT SR_ADI FROM FONETHBYSADM.H_SERVIS", {})["SR_ADI"].dropna())
+        except Exception as e:
+            print(f"  [{b}] şöbə siyahısı alınmadı: {str(e).splitlines()[0]}")
+            out[b] = []
+    return out
+
+
+def interactive_selection():
+    print("\nHesabat hansı şöbələr üzrə qurulsun?")
+    print("  1) Standart: " + ", ".join(l for _, l in GROUPS))
+    print("  2) Standart bölmələrdən seçim")
+    print("  3) İstənilən şöbə(lər) — adını yazın (məs: Reanimasiya; Kardiologiya)")
+    ch = input("Seçim [1]: ").strip() or "1"
+    if ch == "2":
+        for i, (_, l) in enumerate(GROUPS, 1):
+            print(f"     {i}) {l}")
+        return {"bolme": input("Nömrələr (məs: 1,3): ").strip()}
+    if ch == "3":
+        return {"sobe": input("Şöbə adları (; ilə ayırın): ").strip()}
+    return {}
+
+
+# =====================================================================================
+# 7. İŞƏ SALMA
+# =====================================================================================
+def unique_path(path):
+    """Eyni adda fayl varsa (və ya Excel-də açıqdırsa) üzərinə yazmır: sonuna _2, _3 ... əlavə edir."""
+    if not os.path.exists(path):
+        return path
+    base, ext = os.path.splitext(path)
+    i = 2
+    while os.path.exists(f"{base}_{i}{ext}"):
+        i += 1
+    return f"{base}_{i}{ext}"
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Filiallar üzrə şöbə fəaliyyət və satış hesabatı")
+    ap.add_argument("--start", help="Başlanğıc tarix (DD.MM.YYYY, daxil). Default: son tam günün 3 ay əvvəli + 1 gün")
+    ap.add_argument("--end", help="Son tarix (DD.MM.YYYY, daxil). Default: dünən")
+    ap.add_argument("--demo", action="store_true", help="Bazaya qoşulmadan nümunə məlumatla işlət")
+    ap.add_argument("--out", default=".", help="Çıxış qovluğu")
+    ap.add_argument("--bolme", help="Standart bölmələrdən seçim, məs: \"Pediatriya,Neonatologiya\" və ya \"1,3\"")
+    ap.add_argument("--sobe", help="İstənilən şöbə(lər), məs: \"Reanimasiya; Kardiologiya\" — hər biri ayrıca bölmə olur")
+    ap.add_argument("--sec", action="store_true", help="İşə salanda seçim menyusunu göstər")
+    a = ap.parse_args()
+    if a.sec:
+        a.__dict__.update(interactive_selection())
+    if a.bolme and a.sobe:
+        sys.exit("--bolme və --sobe birlikdə istifadə olunmur.")
+    if a.bolme:
+        select_standard(a.bolme)
+    elif a.sobe:
+        select_custom(a.sobe, fetch_branch_names(a.demo))
+    drop_empty_branches()
+    print("Bölmələr: " + ", ".join(GROUP_LABEL[g] for g in GROUP_ORDER) + "  |  Filiallar: " + ", ".join(BRANCH_ORDER))
+
+    today = datetime.combine(date.today(), datetime.min.time())
+    end_incl = datetime.strptime(a.end, "%d.%m.%Y") if a.end else today - timedelta(days=1)
+    start = (datetime.strptime(a.start, "%d.%m.%Y") if a.start
+             else (pd.Timestamp(end_incl + timedelta(days=1)) - pd.DateOffset(months=DEFAULT_MONTHS)).to_pydatetime())
+    end_excl = end_incl + timedelta(days=1)
+    if end_incl < start:
+        sys.exit("Son tarix başlanğıcdan əvvəl ola bilməz.")
+    if end_incl.date() >= date.today():
+        print(f"QEYD: dövrün son günü ({end_incl:%d.%m.%Y}) hələ bitməyib — həmin gün üzrə məlumat natamam olacaq.")
+
+    data, status = demo_fetch(start, end_excl) if a.demo else fetch_live(start, end_excl)
+    if not any(s["OK"] for s in status):
+        sys.exit("Heç bir filial bazasına qoşulmaq mümkün olmadı — hesabat yaradılmadı.")
+
+    model = build_model(data, status, start, end_incl)
+    suffix = "_DEMO" if a.demo else ""
+    if a.bolme or a.sobe:
+        tag = "_".join(re.sub(r"[^\w]+", "", GROUP_LABEL[g])[:14] for g in GROUP_ORDER)[:50]
+        suffix = f"_{tag}" + suffix
+    os.makedirs(a.out, exist_ok=True)
+    path = unique_path(os.path.join(a.out, f"Filiallar_Sobe_Fealiyyet_Hesabati_{start:%Y%m%d}-{end_incl:%Y%m%d}{suffix}.xlsx"))
+    build_workbook(model, start, end_incl, status, path)
+    ctrl = unique_path(path.replace(".xlsx", "_NEZARET.xlsx"))
+    build_control_workbook(model, start, end_incl, ctrl)
+
+    dq = model["dq"]
+    bad = dq["NETICE"].str.startswith("✖").sum() if not dq.empty else 0
+    warn = dq["NETICE"].str.startswith("⚠").sum() if not dq.empty else 0
+    print(f"\nRəhbərlik hesabatı : {path}")
+    print(f"Daxili nəzarət     : {ctrl}  (rəhbərliyə göndərilmir)")
+    print(f"Yoxlamalar: {bad} xəta, {warn} diqqət" +
+          (" — GÖNDƏRMƏZDƏN ƏVVƏL nəzarət faylına baxın!" if bad else " — rəqəmlər uyğundur."))
+    for r in dq[dq["NETICE"].str[:1].isin(["✖", "⚠"])].itertuples():
+        print(f"   {r.NETICE[:1]} {r.FILIAL}: {r.YOXLAMA} — {r.SERH}")
+
+
+if __name__ == "__main__":
+    main()
